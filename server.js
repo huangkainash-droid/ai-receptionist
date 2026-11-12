@@ -30,7 +30,9 @@
  * out, roughly 2x the cost of this whole stack, plus custom audio
  * handling. A text model (Gemini 3.5 Flash-Lite by default) is the correct,
  * cheapest pairing for ConversationRelay, and it is fast enough for
- * short receptionist replies (<1s for a typical answer). LiveKit Agents
+ * short receptionist replies on a paid-tier key (<1s for a typical
+ * answer; the free tier measured 5–12s — see the billing note below
+ * and README "Latency"). LiveKit Agents
  * + Twilio SIP was considered and rejected: it adds a SIP trunk, a
  * second real-time service, and SIP REFER transfer handling, all of
  * which are harder to test with one phone line and one owner.
@@ -111,6 +113,14 @@ const PERSONAL_MOBILE = process.env.PERSONAL_MOBILE || ''; // the owner's person
 // the Twilio number directly and no forwarding is in place.
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'our business';
 const BUSINESS_NUMBER = process.env.BUSINESS_NUMBER || '';
+// OWNER_FIRST_NAME (optional): if callers ask for the owner by first name,
+// the transfer fast-path below recognises it. Leave blank to match only
+// role words (owner, manager, real person, ...).
+const OWNER_FIRST_NAME = (process.env.OWNER_FIRST_NAME || '').toLowerCase();
+// STT_HINTS (optional): comma-separated words the speech recogniser should
+// bias toward — your business name, location names, product names. Defaults
+// to BUSINESS_NAME. Example: "Acme Dental, Main Street, Invisalign".
+const STT_HINTS = process.env.STT_HINTS || BUSINESS_NAME;
 // TRANSFER_NUMBER — the ONE place to change where warm transfers ring.
 // Must be a DIRECT number that does NOT forward to Twilio. Defaults to
 // the personal mobile (same physical phone the owner carries if dual-SIM).
@@ -130,12 +140,19 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 // — no card needed for the free tier. Model gemini-3.5-flash-lite costs
 // $0.30/1M input tokens, $2.50/1M output tokens on the paid tier.
 // Free-tier prompts may be used by Google to improve its products;
-// enable billing for paid-tier privacy terms. Do NOT use
-// gemini-2.5-flash: Google restricted it to projects that had already
+// enable billing for paid-tier privacy terms. Latency warning: on the
+// FREE tier, first-token latency through Google's OpenAI-compatible
+// endpoint measured 5–12s per turn in production (Nov 2026) — far too
+// slow for a phone call. Enabling billing on the project (paid tier,
+// same key, no code change) fixed it. If the AI feels slow, check the
+// billing tier first — see README "Latency".
+// Do NOT use gemini-2.5-flash: Google restricted it to projects that had already
 // actively used it (Sept 2026), so new projects get a bare HTTP 404 —
 // see README "Troubleshooting". OpenAI remains available: set
 // LLM_PROVIDER=openai and OPENAI_API_KEY to use gpt-4o-mini instead.
-// No code change needed to switch.
+// No code change needed to switch. NOTE: OpenAI retires gpt-4o-mini
+// from the API on Jan 14, 2027; its replacement is gpt-6-luna
+// (set OPENAI_MODEL=gpt-6-luna, no code change).
 const LLM_PROVIDER = (process.env.LLM_PROVIDER || (process.env.GEMINI_API_KEY ? 'gemini' : (process.env.OPENAI_API_KEY ? 'openai' : 'gemini'))).toLowerCase();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
@@ -229,6 +246,47 @@ function guessIntent(text) {
   return truncate(text, 80) || 'general question';
 }
 
+/**
+ * Fast-path transfer detection. Production logs (Nov 2026) showed the LLM
+ * taking 5–46s to produce a transfer tool call, so requests that are
+ * unambiguously transfer-shaped skip the model entirely and go straight
+ * to endRelay. Deliberately narrow: policy questions ("What is the refund
+ * policy?", "How do I cancel?") must NOT match — only requests
+ * ("I want a refund", "cancel my booking", "speak to a real person").
+ * The last rule covers confirmations ("Yes, please.") right after the AI
+ * offered a transfer; transferOffered is set from the AI's own reply text
+ * and cleared when the caller says no.
+ */
+function isTransferRequest(text, session) {
+  const t = (text || '').toLowerCase();
+  if (/^\s*(no|nope|not now|no thanks|just answer)\b/.test(t)) {
+    if (session) session.transferOffered = false;
+    return false;
+  }
+  const names = ['manager', 'owner', 'person', 'someone', 'human', 'agent', 'representative'];
+  if (OWNER_FIRST_NAME) names.push(OWNER_FIRST_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (new RegExp(`\\b(speak|talk)\\b.{0,20}\\b(to|with)\\b.{0,20}\\b(${names.join('|')})\\b`).test(t)) return true;
+  if (/\b(transfer|connect)\b.{0,10}\b(me|us)\b/.test(t)) return true;
+  if (/\b(real person|live person|human being|actual person)\b/.test(t)) return true;
+  // Information questions are NOT transfer requests, even when they
+  // contain a trigger word: "I'd like to know the refund policy"
+  // contains "refund" + "like" but asks for information, and on a real
+  // test call it was wrongly transferred instead of answered. A
+  // question word + refund/cancel/credit, or any mention of "policy",
+  // means the caller is asking — the LLM answers from the knowledge
+  // base. False negatives here are safe (the LLM handles the request,
+  // just slower); false positives send answerable questions to a
+  // transfer. Explicit "speak to a person" requests above still win.
+  if (/\bpolicy\b/.test(t)) return false;
+  if (/\b(what|how|when|where|why|which|tell|explain|know|works|work|about)\b/.test(t) && /\b(refund|cancel|credit)\b/.test(t)) return false;
+  if (/\b(refund|money back)\b/.test(t) && /\b(get|want|need|request|give|expect|ask|like|please|me|my)\b/.test(t)) return true;
+  if (/\bcancel\b.{0,20}\b(my|our|the|a|registration|booking|spot|appointment|order)\b/.test(t)) return true;
+  if (/\b(complaint|complain)\b/.test(t)) return true;
+  if (/\b(i'm|i am|we're|we are)\b.{0,20}\b(unhappy|angry|upset|disappointed|frustrated)\b/.test(t)) return true;
+  if (session?.transferOffered && /^\s*(yes|yeah|sure|please|ok|okay|please do|go ahead|that would be great|that works)\b/.test(t)) return true;
+  return false;
+}
+
 // ------------------------------------------------------------ call sessions
 /** callSid -> session. In-memory only; a restart loses in-flight calls, which is acceptable for the MVP. */
 const sessions = new Map();
@@ -244,6 +302,7 @@ function getOrCreateSession(callSid, from, to) {
       messageTaken: false, messageText: '', smsSent: false,
       smsOutcome: '', conferenceName: null, transferTimer: null,
       outboundCallSid: null, turnId: 0, ended: false,
+      transferOffered: false, abortController: null,
     });
   }
   return sessions.get(callSid);
@@ -338,13 +397,25 @@ function parseToolCallFromText(text) {
 }
 
 /**
- * One LLM turn. Non-streaming chat completion (Gemini 3.5 Flash-Lite /
- * gpt-4o-mini answers a short receptionist question in well under a
- * second), then the reply text is streamed to Twilio in sentence
- * chunks. Tool calls are handled by the caller. Returns { text,
- * toolCall } where toolCall is null or { name, args }.
+ * One LLM turn, STREAMED token-by-token. Tokens are forwarded to Twilio
+ * verbatim (last:false) the moment they arrive, and the turn ends with
+ * Twilio's documented closing frame (last:true, empty token) — synthesis
+ * starts on the first token instead of waiting for a sentence or the
+ * whole reply. Production logs showed first-token latency dominating
+ * every turn, so nothing here waits: the only hold is a 1-2 delta prefix
+ * check that keeps the Gemini JSON tool-call fallback from being spoken
+ * aloud. `signal` aborts the call when the caller speaks again or
+ * interrupts, so a superseded turn stops consuming the model instead of
+ * running to completion in the background (logs once showed two
+ * overlapping 16s calls from one split utterance). Tool calls are
+ * handled by the caller. Returns { text, toolCall, streamed } where
+ * toolCall is null or { name, args }, and streamed says whether any
+ * token was already spoken (so the caller does not repeat a fixed
+ * hold/message line). If the provider rejects streaming, askLLM falls
+ * back to one non-streaming completion rather than failing the call.
  */
-async function askLLM(session) {
+async function askLLM(session, sendToken, signal) {
+  const startedAt = Date.now();
   const inHours = isBusinessHours();
   const messages = [
     {
@@ -359,25 +430,104 @@ async function askLLM(session) {
           ? '\nIf you cannot call a tool, reply with ONLY this JSON on its own line instead of speaking it: {"action":"transfer_to_owner","reason":"..."} or {"action":"take_message","caller_name":"...","callback_number":"...","message":"..."}'
           : ''),
     },
-    ...session.history.slice(-20),
+    ...session.history.slice(-12),
   ];
-  const completion = await openai.chat.completions.create({
-    model: LLM_MODEL, temperature: 0.3, messages, tools: TOOLS, tool_choice: 'auto',
-  });
-  const msg = completion.choices[0]?.message || {};
-  const toolCall = msg.tool_calls?.[0];
-  if (toolCall) {
+  const request = {
+    model: LLM_MODEL, temperature: 0.3, max_tokens: 256,
+    messages, tools: TOOLS, tool_choice: 'auto',
+  };
+  let stream;
+  try {
+    stream = await openai.chat.completions.create({ ...request, stream: true, signal });
+  } catch (streamErr) {
+    if (signal?.aborted) throw streamErr; // superseded turn: do not fall back, just stop
+    log(`[llm] streaming unavailable, falling back to non-streaming error=${streamErr.message}`);
+    const completion = await openai.chat.completions.create({ ...request, signal });
+    const msg = completion.choices[0]?.message || {};
+    const toolCall = msg.tool_calls?.[0];
+    if (toolCall) {
+      let args = {};
+      try { args = JSON.parse(toolCall.function.arguments || '{}'); } catch { args = {}; }
+      return { text: '', toolCall: { name: toolCall.function.name, args }, streamed: false };
+    }
+    const fallback = parseToolCallFromText(msg.content || '');
+    if (fallback) {
+      log(`[llm] tool call via JSON fallback provider=${LLM_PROVIDER} name=${fallback.name}`);
+      return { text: '', toolCall: fallback, streamed: false };
+    }
+    return { text: msg.content || '', toolCall: null, streamed: false };
+  }
+  let fullText = '';
+  let toolName = null;
+  let toolArgsText = '';
+  let jsonMode = false;
+  let sawToolCall = false;
+  let streamedAny = false;
+  let firstTokenAt = 0;
+  // Prefix detection for the Gemini JSON fallback: hold tokens only until
+  // the first non-whitespace character classifies the reply. '{' means
+  // JSON (hold everything, parse at the end); anything else means speech
+  // (forward verbatim from here on). This costs at most one or two deltas.
+  let prefixBuf = '';
+  let decided = false;
+  const forward = (token, isLast) => {
+    streamedAny = true;
+    sendToken(token, isLast);
+  };
+  for await (const chunk of stream) {
+    if (!firstTokenAt) firstTokenAt = Date.now();
+    const delta = chunk.choices?.[0]?.delta || {};
+    if (delta.tool_calls?.length) {
+      sawToolCall = true;
+      for (const tc of delta.tool_calls) {
+        if (tc.function?.name) toolName = tc.function.name;
+        toolArgsText += tc.function?.arguments || '';
+      }
+    }
+    if (!delta.content) continue;
+    fullText += delta.content;
+    if (jsonMode || sawToolCall) continue;
+    if (!decided) {
+      prefixBuf += delta.content;
+      const first = prefixBuf.match(/\S/);
+      if (!first && prefixBuf.length < 200) continue; // leading whitespace only, keep holding
+      decided = true;
+      if (first && prefixBuf[first.index] === '{') {
+        jsonMode = true; // Gemini JSON tool-call fallback: hold everything until parsed.
+        continue;
+      }
+      forward(prefixBuf, false);
+      prefixBuf = '';
+      continue;
+    }
+    // Verbatim forwarding: Twilio's own guidance is to stream tokens as
+    // they arrive (last:false) without trimming, so synthesis starts on
+    // the first token instead of waiting for a sentence.
+    forward(delta.content, false);
+  }
+  const elapsedMs = Date.now() - startedAt;
+  if (sawToolCall && toolName) {
     let args = {};
-    try { args = JSON.parse(toolCall.function.arguments || '{}'); } catch { args = {}; }
-    return { text: msg.content || '', toolCall: { name: toolCall.function.name, args } };
+    try { args = JSON.parse(toolArgsText || '{}'); } catch { args = {}; }
+    log(`[llm] done ms=${elapsedMs} tool=${toolName} streamed=${streamedAny}`);
+    return { text: '', toolCall: { name: toolName, args }, streamed: streamedAny };
   }
-  // Gemini fallback: model answered in words / JSON instead of a tool call.
-  const fallback = parseToolCallFromText(msg.content || '');
-  if (fallback) {
-    log(`[llm] tool call via JSON fallback provider=${LLM_PROVIDER} name=${fallback.name}`);
-    return { text: '', toolCall: fallback };
+  if (jsonMode) {
+    const fallback = parseToolCallFromText(fullText);
+    if (fallback) {
+      log(`[llm] tool call via JSON fallback provider=${LLM_PROVIDER} name=${fallback.name} ms=${elapsedMs}`);
+      return { text: '', toolCall: fallback, streamed: false };
+    }
+    // JSON-shaped but unparseable: never speak raw JSON to a caller.
+    log(`[llm] unparseable JSON-shaped reply, using apology ms=${elapsedMs} text=${truncate(fullText, 80)}`);
+    return { text: 'Sorry, I had trouble with that. Could you say it once more?', toolCall: null, streamed: false };
   }
-  return { text: msg.content || '', toolCall: null };
+  // Closing frame: Twilio's documented end-of-turn signal is a final
+  // message with last:true and an empty token. Sent even when nothing was
+  // spoken, so the turn always terminates cleanly.
+  forward('', true);
+  log(`[llm] done ms=${elapsedMs} ttfbMs=${firstTokenAt ? firstTokenAt - startedAt : -1} chars=${fullText.length} streamed=${streamedAny}`);
+  return { text: fullText, toolCall: null, streamed: streamedAny };
 }
 
 /** Send reply text to ConversationRelay in sentence chunks, last chunk flagged last:true. */
@@ -499,6 +649,12 @@ app.post('/voice', (req, res) => {
   const wsUrl = PUBLIC_URL.replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://') + '/relay';
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect({ action: `${PUBLIC_URL}/connect-action`, method: 'POST' });
+  // STT tuning (from production log diagnosis, Nov 2026): Deepgram Flux
+  // fuses transcription with end-of-turn detection and answers 200-600ms
+  // faster than the default nova-3 model; eotThreshold 0.7 finalises a turn
+  // a little earlier than the 0.8 default. dtmfDetection must be on for
+  // the press-0 transfer in the Relay handler to ever fire (its default
+  // is off). Hints bias transcription toward your business/location names.
   connect.conversationRelay({
     url: wsUrl,
     welcomeGreeting: `Hello, thank you for calling ${BUSINESS_NAME}. I'm an AI assistant. How can I help you today?`,
@@ -506,6 +662,10 @@ app.post('/voice', (req, res) => {
     ttsProvider: 'Amazon',
     voice: 'Joanna-Neural',
     transcriptionProvider: 'Deepgram',
+    speechModel: 'flux',
+    eotThreshold: '0.7',
+    dtmfDetection: true,
+    hints: STT_HINTS,
     interruptible: true,
   });
   return res.type('text/xml').send(twiml.toString());
@@ -559,21 +719,27 @@ app.post('/connect-action', async (req, res) => {
 
 /**
  * POST /owner-whisper — TwiML for the outbound leg to the owner.
- * Plays the whisper summary, then Gather: 1 = accept and join the
- * conference, 2 / no input = decline (the caller falls back to a message).
+ * Plays one short whisper line, then Gather: 1 = accept and join the
+ * conference, anything else / no input = decline (the caller falls
+ * back to a message). Kept to one sentence on purpose: an earlier
+ * version repeated the transfer reason twice (intent + summary notes)
+ * and sounded verbose and repetitive on a real test call.
  */
 app.post('/owner-whisper', (req, res) => {
   const origCallSid = req.query.origCallSid;
   const session = getSession(origCallSid);
-  const summary = session
-    ? `Caller ${session.from} asking about ${session.intent || 'a general question'}. ${truncate(session.summaryNotes.join(' '), 160)}`
-    : `A ${BUSINESS_NAME} caller wants to speak to you.`;
+  const rawAbout = session?.intent || 'a general question';
+  // Vague intents ("wants to speak to...") read badly in a whisper;
+  // collapse them instead of repeating the caller's words back.
+  const about = /want|speak/i.test(rawAbout) ? 'a general question' : truncate(rawAbout, 40);
+  const from = session?.from || 'an unknown number';
+  const summary = `${BUSINESS_NAME} call from ${from}, about ${about}. Press 1 to accept.`;
   const twiml = new twilio.twiml.VoiceResponse();
   const gather = twiml.gather({
     numDigits: 1, timeout: WHISPER_TIMEOUT_SECONDS,
     action: `${PUBLIC_URL}/owner-accept?origCallSid=${encodeURIComponent(origCallSid)}`, method: 'POST',
   });
-  gather.say(`${BUSINESS_NAME} call. ${escapeXml(summary)} Press 1 to accept and join the call, or press 2 to decline.`);
+  gather.say(escapeXml(summary));
   twiml.say('No input received. I will let the caller leave a message.');
   twiml.hangup();
   return res.type('text/xml').send(twiml.toString());
@@ -696,6 +862,7 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'interrupt') {
       session.turnId += 1; // invalidate any in-flight LLM turn
+      if (session.abortController) session.abortController.abort(); // stop the model call too
       return;
     }
     if (msg.type === 'dtmf') {
@@ -719,6 +886,25 @@ wss.on('connection', (ws) => {
     if (!session.intent) session.intent = guessIntent(userText);
     session.history.push({ role: 'user', content: userText });
 
+    // A new prompt supersedes any in-flight LLM turn: abort it so it
+    // stops consuming the model instead of running to completion in the
+    // background (production logs once showed two overlapping 16s calls
+    // from a single split utterance).
+    if (session.abortController) session.abortController.abort();
+    session.abortController = null;
+
+    // Fast path: unmistakable transfer requests skip the LLM entirely
+    // (it took 5-46s to produce a transfer tool call in production
+    // logs). No hold line is spoken here: endRelay returns the call to
+    // /connect-action, which says the hold line once.
+    if (isBusinessHours() && configOk.transferNumber && isTransferRequest(userText, session)) {
+      session.summaryNotes.push(`Transfer (fast path): ${userText}`);
+      endRelay(ws, { action: 'transfer', reason: userText });
+      return;
+    }
+    const controller = new AbortController();
+    session.abortController = controller;
+
     if (!openai) {
       sendText(ws, "I'm sorry, I'm not able to answer right now. Please leave your name and number after the beep and the owner will call you back.");
       endRelay(ws, { action: 'message', caller_name: 'not given', callback_number: session.from || 'not given', message: userText });
@@ -727,8 +913,14 @@ wss.on('connection', (ws) => {
 
     let result;
     try {
-      result = await askLLM(session);
+      result = await askLLM(session, (token, isLast) => {
+        if (closed || turnId !== session.turnId) return; // caller interrupted / hung up mid-reply
+        ws.send(JSON.stringify({ type: 'text', token, last: isLast }));
+      }, controller.signal);
     } catch (err) {
+      if (session.abortController === controller) session.abortController = null;
+      if (closed || turnId !== session.turnId) return; // superseded turn: stay silent
+      if (err?.name === 'AbortError') return; // aborted turn: stay silent
       // Log the full SDK error: the bare message ("404 status code (no body)")
       // hid whether the failure was the model name, the endpoint, or the
       // key/project. The error body never contains the API key.
@@ -737,6 +929,7 @@ wss.on('connection', (ws) => {
       sendText(ws, "Sorry, I had trouble with that. Could you say it once more, or I can take a message for the owner.");
       return;
     }
+    if (session.abortController === controller) session.abortController = null;
     if (closed || turnId !== session.turnId) return; // caller interrupted / hung up
 
     if (result.toolCall) {
@@ -744,7 +937,10 @@ wss.on('connection', (ws) => {
       if (name === 'transfer_to_owner') {
         const reason = args.reason || session.intent || 'wants to speak to the owner';
         session.summaryNotes.push(`Transfer: ${reason}`);
-        sendText(ws, "I'll connect you to the owner now, please hold.");
+        // No spoken hold line here: ending the Relay session returns the
+        // call to /connect-action, which says the hold line once. Speaking
+        // it here too added ~4s (TTS playback before session teardown)
+        // and repeated the same line twice (production logs).
         endRelay(ws, { action: 'transfer', reason });
         return;
       }
@@ -753,7 +949,7 @@ wss.on('connection', (ws) => {
         session.callbackNumber = args.callback_number && args.callback_number !== 'not given' ? args.callback_number : session.callbackNumber;
         session.messageText = args.message || '';
         session.intent = session.intent || guessIntent(args.message);
-        sendText(ws, "I'll pass your message to the owner and you will get a call back.");
+        if (!result.streamed) sendText(ws, "I'll pass your message to the owner and you will get a call back.");
         endRelay(ws, {
           action: 'message',
           caller_name: session.callerName || 'not given',
@@ -766,7 +962,10 @@ wss.on('connection', (ws) => {
 
     if (result.text) {
       session.history.push({ role: 'assistant', content: result.text });
-      sendText(ws, result.text);
+      // Remember transfer offers so a following "Yes, please." can take
+      // the fast path instead of waiting on another model call.
+      if (/connect you|transfer you|put you through/i.test(result.text)) session.transferOffered = true;
+      if (!result.streamed) sendText(ws, result.text);
     }
   });
 

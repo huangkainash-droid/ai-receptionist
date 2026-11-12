@@ -22,10 +22,16 @@ message — it never invents an address, price, or policy.
   recognition and text-to-speech; this server handles the conversation.
 - Text LLM (Gemini by default, OpenAI as a fallback) answers from your
   knowledge base, with two tools: warm transfer and message taking.
-- Conference-based warm transfer with a whisper summary ("Caller …
-  asking about … Press 1 to accept"), a press-2 decline path, and a
-  no-answer fallback to voicemail with transcription — the caller is
-  never left in hold music.
+- Conference-based warm transfer with a one-line whisper summary
+  ("[Business] call from [number], about [topic]. Press 1 to
+  accept"), decline on any other input, and a no-answer fallback to
+  voicemail with transcription — the caller is never left in hold music.
+- Latency-tuned for phone calls: tokens stream to Twilio verbatim as
+  they arrive, Deepgram Flux handles transcription with faster
+  end-of-turn detection, unmistakable transfer requests skip the model
+  entirely (transfer fast-path), and a new utterance aborts the
+  previous model call instead of letting two calls overlap. See
+  "Latency" below.
 - SMS summary after every call: time, caller number, name if given,
   what it was about, outcome, and callback number. Sent once per call.
 - Transfer loop guard: the server refuses to transfer a call to a
@@ -165,6 +171,14 @@ OpenAI-compatible endpoint; OpenAI gpt-4o-mini fallback)
 2. Copy the key into your deployment's environment variables as
    `GEMINI_API_KEY` (step 4). Never paste keys into chat, and never
    commit them to the repo.
+3. **Enable billing on the project.** The free tier works, but in
+   production (Nov 2026) its first-token latency through Google's
+   OpenAI-compatible endpoint measured 5–12 seconds per turn — far
+   too slow for a phone call. Linking a billing account to the
+   project (Google Cloud Console → Billing) moves the same key to
+   the paid tier with no code change, and fixed the delay. See
+   "Latency" below. Note: Gemini API billing is prepay — keep a
+   positive credit balance or requests stop with HTTP 402.
 
 ### 3. Fill in the templates
 
@@ -213,6 +227,8 @@ not use `localhost` as `PUBLIC_URL` — Twilio cannot reach it.
 |---|---|---|
 | `PUBLIC_URL` | Yes | Public URL of this server, no trailing slash (e.g. `https://<your-app>.up.railway.app`). Used to build the `wss://` Relay URL and all TwiML action URLs. Must match the deployed domain. |
 | `BUSINESS_NAME` | Yes | Business name spoken in the greeting, the transfer whisper, and SMS summaries. |
+| `OWNER_FIRST_NAME` | No | Owner's first name, so callers asking for them by name match the transfer fast-path. Leave blank to match role words only. |
+| `STT_HINTS` | No (defaults to `BUSINESS_NAME`) | Comma-separated words the speech recogniser biases toward (business/location/product names). |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | Yes | From twilio.com/console. |
 | `TWILIO_NUMBER` | Yes | The Twilio number the AI answers, E.164 (`+1` + 10 digits). |
 | `BUSINESS_NUMBER` | Only if forwarding | Your existing public business line, E.164. Used ONLY as a loop guard — the server refuses to transfer to it while it forwards to Twilio. Leave blank if callers dial the Twilio number directly. |
@@ -223,7 +239,7 @@ not use `localhost` as `PUBLIC_URL` — Twilio cannot reach it.
 | `GEMINI_MODEL` | No (default `gemini-3.5-flash-lite`) | Do not set `gemini-2.5-flash` — see Troubleshooting. |
 | `GEMINI_BASE_URL` | No | Gemini OpenAI-compatible endpoint. Do not change unless Google moves it. |
 | `OPENAI_API_KEY` | Yes if `openai` | From platform.openai.com/api-keys. |
-| `OPENAI_MODEL` | No (default `gpt-4o-mini`) | Text model for the OpenAI fallback. |
+| `OPENAI_MODEL` | No (default `gpt-4o-mini`) | Text model for the OpenAI fallback. Note: OpenAI retires `gpt-4o-mini` from the API on Jan 14, 2027; its replacement is `gpt-6-luna`. |
 | `BUSINESS_HOURS_START` / `BUSINESS_HOURS_END` | No (default `08:00` / `17:00`) | Warm-transfer window, 24-hour HH:MM in `TIMEZONE`. Outside it: message only. |
 | `TIMEZONE` | No (default `America/New_York`) | IANA timezone name; daylight saving is handled. |
 | `TRANSFER_TIMEOUT_SECONDS` | No (default `25`) | Seconds to wait for the owner to press 1 before falling back to a message. |
@@ -374,6 +390,53 @@ invent an answer to. Test 0 checks the transfer loop guard without a
 call. Keep the server logs open while testing — every step logs
 `[voice]`, `[relay]`, `[llm]`, `[transfer]`, `[sms]` with the call SID.
 
+## Latency
+
+What "slow" looked like in production, and what fixed it (measured
+from server logs, Nov 2026):
+
+- **The billing tier was the root cause.** On Gemini's free tier,
+  first-token latency (TTFB) through Google's OpenAI-compatible
+  endpoint measured 5–12 seconds per turn, highly variable, while
+  generation itself was fast (total time minus TTFB was usually
+  under a second). One transfer tool call took 46 seconds. Enabling
+  billing on the Google Cloud project moved the same key to the paid
+  tier and fixed the delay, with no code or key change. If the AI
+  feels slow, check the billing tier before changing anything else.
+  Google's paid tier guarantees higher rate limits, not latency —
+  but the free tier's queuing was the observed cause here.
+- **Tokens stream verbatim.** The server forwards each token to
+  Twilio the moment it arrives (`last:false`), ending with Twilio's
+  documented closing frame (`last:true`, empty token), so speech
+  synthesis starts on the first token. The only hold is a 1–2 delta
+  prefix check that keeps Gemini's JSON tool-call fallback from being
+  spoken aloud. If the provider rejects streaming, the server falls
+  back to one non-streaming completion.
+- **Transfer fast-path.** Requests that are unambiguously
+  transfer-shaped ("speak to a real person", "I want a refund",
+  "cancel my booking", complaints, "yes" right after the AI offered
+  a transfer) skip the model entirely and go straight to the
+  transfer. Policy questions ("What is the refund policy?") do not
+  match. See `isTransferRequest()` in `server.js`.
+- **No double hold line.** The transfer hold message is spoken once,
+  by `/connect-action` — not once by the AI and again by the phone
+  system. Speaking it in the Relay session added ~4 seconds of TTS
+  playback before teardown and repeated the same line twice.
+- **Stale turns are aborted.** A new utterance or an interrupt aborts
+  the in-flight model call. Without this, one split utterance
+  produced two overlapping ~16s model calls that slowed each other.
+- **Faster transcription.** The `/voice` handler uses Deepgram Flux
+  (`speechModel: 'flux'`, fusing transcription with end-of-turn
+  detection, 200–600ms faster than the default nova-3),
+  `eotThreshold: '0.7'` (finalises a turn slightly earlier than the
+  0.8 default), `dtmfDetection: true` (required for press-0 transfer
+  — its default is off, so the DTMF handler never fired without it),
+  and `hints` biased toward your business names.
+- **Diagnosing.** Every turn logs `[llm] done ms=… ttfbMs=… chars=…
+  streamed=…`. If `ttfbMs` is in the seconds, the model endpoint is
+  the bottleneck, not this server. The `[llm] FAILED` line records
+  provider, model, status, and error body.
+
 ## Editing facts
 
 Edit `knowledge-base.md` for prices, dates, locations, and policies,
@@ -416,6 +479,12 @@ in `server.js`; the code only reads the two files.
   The detailed `[llm] FAILED` log line records the provider, model,
   status, and any error body, which is what distinguishes this
   failure from a bad key (which returns an error body).
+- **AI answers, but slowly (multi-second pause before each reply):**
+  check the `[llm] done … ttfbMs=…` lines in the server logs. If
+  TTFB is in the seconds on Gemini, the project's billing tier is
+  the likely cause — the free tier measured 5–12s per turn in
+  production; enabling billing on the project fixed it with no code
+  or key change. See "Latency" above.
 - No answer on the Twilio number: check the Voice webhook is
   `https://<domain>/voice` (POST), `PUBLIC_URL` matches the domain,
   and the ConversationRelay AI Addendum is accepted in Twilio.

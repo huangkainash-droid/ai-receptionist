@@ -38,6 +38,12 @@ the Twilio number itself — same result expected.
 - **Hang up.** **Expect:** the owner gets an SMS summary within a
   minute: caller number, "pricing", outcome "answered by AI".
 - **Fail if:** any other price is quoted, or no SMS arrives.
+- **Latency check (all tests):** the AI should start replying within
+  about 1–2 seconds of you finishing a sentence. A pause of 5+
+  seconds means the model endpoint is slow — on Gemini, check the
+  project's billing tier first (free tier measured 5–12s per turn;
+  see README "Latency"), and check `[llm] done … ttfbMs=…` in the
+  server logs.
 
 ## 2. Address question (only listed addresses may be quoted)
 
@@ -55,10 +61,12 @@ the Twilio number itself — same result expected.
 
 - **When:** inside business hours. **Call** the business line.
   **Say:** "I need to speak to the owner about a refund."
-- **Expect:** AI says "I'll connect you to the owner now, please
-  hold." Hold music plays. The owner's **personal mobile** rings
-  (not the business line) and they hear a whisper: caller number +
-  "asking about refund" + "Press 1 to accept".
+- **Expect:** the phone system says "Please hold while I connect
+  you to the owner" once (the AI itself says nothing first — the
+  transfer fast-path skips the model for this request). Hold music
+  plays. The owner's **personal mobile** rings
+  (not the business line) and they hear a one-line whisper: business
+  name + caller number + topic + "Press 1 to accept".
 - **Owner presses 1.** **Expect:** owner and caller can talk.
   Owner hangs up. **Expect:** SMS summary: outcome "transferred to
   the owner".
@@ -85,8 +93,8 @@ the Twilio number itself — same result expected.
   silent / not answered (agree this with the owner first — do not
   just let it ring unannounced).
 - **Call** the business line. **Say:** "Can I speak to the owner?"
-- **Expect:** AI says it will connect you; hold music; the owner's
-  phone rings and is **not** answered. After ~25 seconds the caller
+- **Expect:** the phone system says it will connect you; hold music;
+  the owner's phone rings and is **not** answered. After ~25 seconds the caller
   hears: "The owner isn't available right now. Please leave your
   name, callback number, and a brief message after the beep." Leave
   a short message.
