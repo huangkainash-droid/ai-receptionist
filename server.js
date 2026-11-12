@@ -1,0 +1,793 @@
+/**
+ * AI Receptionist
+ * ===============
+ * A self-hosted AI phone receptionist for a small business. Callers
+ * reach an AI assistant that answers from a fixed knowledge base
+ * (knowledge-base.md), warm-transfers to the owner during business
+ * hours, takes messages outside them, and sends an SMS summary after
+ * every call.
+ *
+ * Stack: Twilio ConversationRelay (Twilio does STT + TTS, $0.07/min)
+ *        + Gemini gemini-3.5-flash-lite (text LLM, via Google's
+ *          OpenAI-compatible endpoint; $0.30 / 1M input tokens,
+ *          $2.50 / 1M output tokens). OpenAI gpt-4o-mini remains
+ *          supported as a fallback via LLM_PROVIDER=openai.
+ *        + Twilio Programmable Voice for the phone number, SMS, and
+ *          Conference-based warm transfer.
+ *
+ * Why gemini-3.5-flash-lite and not gemini-2.5-flash: in September
+ * 2026 Google restricted the 2.5 models to projects that had already
+ * actively used them, so new projects calling gemini-2.5-flash get a
+ * bare HTTP 404 with no error body; Google deprecated 2.5-flash on
+ * November 2, 2026 and routes its requests to gemini-3.5-flash-lite
+ * from December 1, 2026. See README "Troubleshooting".
+ *
+ * Why this stack (and not gpt-realtime-mini / LiveKit):
+ * ConversationRelay exchanges TEXT with this server — Twilio transcribes
+ * the caller and speaks the text we send back. A speech-to-speech model
+ * such as gpt-realtime-mini cannot plug into that text loop; it would
+ * need raw-audio Media Streams instead, at ~$0.06/min in + $0.24/min
+ * out, roughly 2x the cost of this whole stack, plus custom audio
+ * handling. A text model (Gemini 3.5 Flash-Lite by default) is the correct,
+ * cheapest pairing for ConversationRelay, and it is fast enough for
+ * short receptionist replies (<1s for a typical answer). LiveKit Agents
+ * + Twilio SIP was considered and rejected: it adds a SIP trunk, a
+ * second real-time service, and SIP REFER transfer handling, all of
+ * which are harder to test with one phone line and one owner.
+ *
+ * Gemini note: Google's OpenAI-compatible endpoint
+ * (https://generativelanguage.googleapis.com/v1beta/openai/) accepts
+ * the same chat.completions shape as OpenAI, so the same code drives
+ * either provider. Tool calling through that endpoint is limited/beta,
+ * so askLLM() also parses a JSON fallback from the model text
+ * ({"action":"transfer_to_owner","reason":"..."} or
+ * {"action":"take_message",...}) — see parseToolCallFromText().
+ *
+ * Call flow:
+ *   1. Caller dials the Twilio number — directly, or via unconditional
+ *      call forwarding (*72) from an existing business line. See README;
+ *      the business line itself is never ported.
+ *   2. POST /voice returns <Connect><ConversationRelay> to wss://…/relay.
+ *   3. The LLM answers from knowledge-base.md only. It may call one
+ *      of two tools: transfer_to_owner (business hours only) or
+ *      take_message (any time, and always out of hours).
+ *   4. The server ends the Relay session with handoffData. Twilio
+ *      POSTs to /connect-action, which either:
+ *        - starts a warm transfer: caller is put in a Conference,
+ *          the owner is called on TRANSFER_NUMBER with a spoken whisper
+ *          summary, presses 1 to join the conference, or
+ *        - takes a message and ends the call.
+ *   5. If the owner does not join within TRANSFER_TIMEOUT_SECONDS (default
+ *      25s), the caller leg is redirected to /take-message, which
+ *      records a voicemail. Either way the owner gets an SMS summary.
+ *   6. After every call an SMS summary goes to PERSONAL_MOBILE.
+ *
+ * TRANSFER TARGET — READ THIS BEFORE CHANGING IT:
+ * TRANSFER_NUMBER must be a DIRECT number that does NOT forward to
+ * Twilio. It defaults to the owner's personal mobile (PERSONAL_MOBILE).
+ * If the business line (BUSINESS_NUMBER) unconditionally forwards
+ * (*72) to the Twilio number, then dialling the business line from
+ * Twilio would bounce straight back to Twilio and the owner would
+ * never get the call — an infinite loop. So NEVER set TRANSFER_NUMBER
+ * to the forwarding business number while *72 forwarding is on; the
+ * server refuses to transfer to that number (or to the Twilio number
+ * itself) and takes a message instead. See README "The transfer loop
+ * warning" for the clean alternatives. A common working setup: both
+ * lines on one dual-SIM handset — the business line forwards to
+ * Twilio, the personal line does not, so transferring to the personal
+ * number rings the same phone the owner carries, with no loop.
+ *
+ * Business identity is configurable: set BUSINESS_NAME, BUSINESS_NUMBER,
+ * and the numbers in .env — no business facts are hard-coded in this
+ * file. Edit knowledge-base.md and prompts/system-prompt.md for what
+ * the AI says and may quote. Config is via .env only — see .env.example.
+ * No secrets in code.
+ */
+
+import 'dotenv/config';
+import express from 'express';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import twilio from 'twilio';
+import OpenAI from 'openai';
+
+// ---------------------------------------------------------------- config
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const PORT = Number(process.env.PORT || 3000);
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, ''); // e.g. https://xyz.railway.app — no trailing slash
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER || ''; // the Twilio number callers are forwarded to, E.164
+const PERSONAL_MOBILE = process.env.PERSONAL_MOBILE || ''; // the owner's personal mobile, E.164 — NEVER hard-code a real number. SMS summaries go here.
+// Business identity — all configurable, nothing hard-coded. BUSINESS_NAME
+// is spoken in the greeting, the transfer whisper, and SMS summaries.
+// BUSINESS_NUMBER is the public business line (E.164). It is used ONLY as
+// a loop guard: if it forwards (*72) to the Twilio number, the server
+// must never transfer a call back to it. Leave it empty if callers dial
+// the Twilio number directly and no forwarding is in place.
+const BUSINESS_NAME = process.env.BUSINESS_NAME || 'our business';
+const BUSINESS_NUMBER = process.env.BUSINESS_NUMBER || '';
+// TRANSFER_NUMBER — the ONE place to change where warm transfers ring.
+// Must be a DIRECT number that does NOT forward to Twilio. Defaults to
+// the personal mobile (same physical phone the owner carries if dual-SIM).
+// NEVER set this to BUSINESS_NUMBER while that number forwards (*72) to
+// Twilio: the call would loop back to Twilio and never reach the owner.
+// See README "The transfer loop warning".
+const TRANSFER_NUMBER = process.env.TRANSFER_NUMBER || PERSONAL_MOBILE;
+const digitsOnly = (n) => String(n || '').replace(/\D/g, '');
+const isLoopNumber = (n) => {
+  const d = digitsOnly(n);
+  return d !== '' && ((BUSINESS_NUMBER && d === digitsOnly(BUSINESS_NUMBER)) || (TWILIO_NUMBER && d === digitsOnly(TWILIO_NUMBER)));
+};
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+// --- LLM provider: gemini (default) or openai --------------------------------
+// Gemini (default): get a key free at aistudio.google.com/apikey
+// — no card needed for the free tier. Model gemini-3.5-flash-lite costs
+// $0.30/1M input tokens, $2.50/1M output tokens on the paid tier.
+// Free-tier prompts may be used by Google to improve its products;
+// enable billing for paid-tier privacy terms. Do NOT use
+// gemini-2.5-flash: Google restricted it to projects that had already
+// actively used it (Sept 2026), so new projects get a bare HTTP 404 —
+// see README "Troubleshooting". OpenAI remains available: set
+// LLM_PROVIDER=openai and OPENAI_API_KEY to use gpt-4o-mini instead.
+// No code change needed to switch.
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || (process.env.GEMINI_API_KEY ? 'gemini' : (process.env.OPENAI_API_KEY ? 'openai' : 'gemini'))).toLowerCase();
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+const GEMINI_BASE_URL = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/').replace(/\/?$/, '/');
+const LLM_MODEL = LLM_PROVIDER === 'openai' ? OPENAI_MODEL : GEMINI_MODEL;
+const LLM_API_KEY = LLM_PROVIDER === 'openai' ? OPENAI_API_KEY : GEMINI_API_KEY;
+const TIMEZONE = process.env.TIMEZONE || 'America/New_York';
+const BUSINESS_HOURS_START = process.env.BUSINESS_HOURS_START || '08:00';
+const BUSINESS_HOURS_END = process.env.BUSINESS_HOURS_END || '17:00';
+const TRANSFER_TIMEOUT_SECONDS = Number(process.env.TRANSFER_TIMEOUT_SECONDS || 25);
+const WHISPER_TIMEOUT_SECONDS = Number(process.env.WHISPER_TIMEOUT_SECONDS || 10);
+
+const E164 = /^\+1\d{10}$/;
+const configOk = {
+  twilio: Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && E164.test(TWILIO_NUMBER)),
+  llm: Boolean(LLM_API_KEY),
+  llmProvider: LLM_PROVIDER,
+  llmModel: LLM_MODEL,
+  // kept for backward compatibility with older health checks / docs
+  openai: Boolean(OPENAI_API_KEY),
+  gemini: Boolean(GEMINI_API_KEY),
+  personalMobile: E164.test(PERSONAL_MOBILE),
+  transferNumber: E164.test(TRANSFER_NUMBER) && !isLoopNumber(TRANSFER_NUMBER),
+  publicUrl: Boolean(PUBLIC_URL && /^https:\/\//.test(PUBLIC_URL)),
+};
+if (!configOk.twilio) console.warn('[config] Twilio is not fully configured (need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER in E.164). Voice/SMS will be disabled until set.');
+if (!configOk.llm) console.warn(`[config] No LLM key — set GEMINI_API_KEY (default provider, free at aistudio.google.com/apikey) or OPENAI_API_KEY with LLM_PROVIDER=openai. The AI will use the fallback message only.`);
+if (!configOk.personalMobile) console.warn('[config] PERSONAL_MOBILE is missing or not E.164 (+1 + 10 digits) — SMS summaries are disabled until set.');
+if (!process.env.TRANSFER_NUMBER && configOk.personalMobile) console.warn('[config] TRANSFER_NUMBER not set — warm transfer defaults to PERSONAL_MOBILE. That is correct if the personal line does not forward to Twilio.');
+if (!configOk.transferNumber) console.warn('[config] TRANSFER_NUMBER is missing, not E.164, or it would LOOP (it is BUSINESS_NUMBER or the Twilio number itself) — warm transfer is disabled and the AI will take a message instead. Set TRANSFER_NUMBER to a direct number that does not forward to Twilio.');
+if (!configOk.publicUrl) console.warn('[config] PUBLIC_URL is missing or not https:// — Twilio cannot reach this server. Set it to your deployed URL (Railway/Render/Fly) or an ngrok https URL for local testing.');
+
+const twilioClient = configOk.twilio ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+// One OpenAI SDK client drives either provider: OpenAI's own API, or
+// Gemini's OpenAI-compatible endpoint (same chat.completions shape).
+const openai = configOk.llm
+  ? new OpenAI(LLM_PROVIDER === 'openai'
+      ? { apiKey: OPENAI_API_KEY }
+      : { apiKey: GEMINI_API_KEY, baseURL: GEMINI_BASE_URL })
+  : null;
+if (openai) log(`[config] LLM provider=${LLM_PROVIDER} model=${LLM_MODEL} baseURL=${LLM_PROVIDER === 'openai' ? 'https://api.openai.com/v1' : GEMINI_BASE_URL}`);
+
+// ------------------------------------------------------- prompt + knowledge
+function readText(relPath, fallback) {
+  try {
+    return fs.readFileSync(path.join(__dirname, relPath), 'utf8');
+  } catch {
+    console.warn(`[config] Could not read ${relPath}, using fallback.`);
+    return fallback;
+  }
+}
+const SYSTEM_PROMPT = readText('prompts/system-prompt.md', 'You are the AI receptionist for a small business. Answer briefly, in English. Only quote facts you are given. Never promise refunds. Offer to take a message when unsure.');
+const KNOWLEDGE_BASE = readText('knowledge-base.md', '');
+
+// ---------------------------------------------------------------- helpers
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+/** Current time in the business timezone, as HH:MM (24h). DST-safe via IANA tz. */
+function nowET() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date());
+}
+function nowETFull() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE, dateStyle: 'medium', timeStyle: 'short',
+  }).format(new Date());
+}
+function isBusinessHours(date = new Date()) {
+  const hhmm = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date);
+  return hhmm >= BUSINESS_HOURS_START && hhmm < BUSINESS_HOURS_END;
+}
+function escapeXml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function truncate(s, n = 140) {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+function guessIntent(text) {
+  const t = (text || '').toLowerCase();
+  if (/refund|cancel|credit|money back/.test(t)) return 'refund/cancellation';
+  if (/price|cost|how much|fee|discount/.test(t)) return 'pricing';
+  if (/location|address|where|directions|parking/.test(t)) return 'location';
+  if (/register|sign up|enroll|book|appointment|reserve/.test(t)) return 'registration/booking';
+  if (/hours|open|close|schedule|when/.test(t)) return 'hours/schedule';
+  return truncate(text, 80) || 'general question';
+}
+
+// ------------------------------------------------------------ call sessions
+/** callSid -> session. In-memory only; a restart loses in-flight calls, which is acceptable for the MVP. */
+const sessions = new Map();
+
+function getOrCreateSession(callSid, from, to) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      callSid, from: from || 'unknown', to: to || TWILIO_NUMBER,
+      createdAt: new Date().toISOString(),
+      history: [], // OpenAI chat messages {role, content}
+      callerName: null, callbackNumber: null, intent: '',
+      summaryNotes: [], transferred: false, ownerJoined: false,
+      messageTaken: false, messageText: '', smsSent: false,
+      smsOutcome: '', conferenceName: null, transferTimer: null,
+      outboundCallSid: null, turnId: 0, ended: false,
+    });
+  }
+  return sessions.get(callSid);
+}
+function getSession(callSid) { return sessions.get(callSid); }
+
+// ------------------------------------------------------------- SMS summary
+async function sendSmsSummary(session, outcome) {
+  if (!session || session.smsSent) return;
+  session.smsSent = true; // set before the await: prevents double-send from parallel hooks
+  session.smsOutcome = outcome;
+  const name = session.callerName || 'not given';
+  const callback = session.callbackNumber || session.from || 'not given';
+  const body =
+    `${BUSINESS_NAME} call ${nowETFull()} (${TIMEZONE})\n` +
+    `From: ${session.from}\n` +
+    `Name: ${name}\n` +
+    `About: ${session.intent || 'general question'}\n` +
+    `Outcome: ${outcome}\n` +
+    `Callback: ${callback}` +
+    (session.messageText ? `\nMessage: ${truncate(session.messageText, 200)}` : '');
+  if (!twilioClient || !configOk.personalMobile) {
+    log(`[sms] NOT SENT (Twilio/personal mobile not configured) callSid=${session.callSid} outcome=${outcome}\n${body}`);
+    return;
+  }
+  try {
+    const msg = await twilioClient.messages.create({ from: TWILIO_NUMBER, to: PERSONAL_MOBILE, body });
+    log(`[sms] sent sid=${msg.sid} callSid=${session.callSid} outcome=${outcome}`);
+  } catch (err) {
+    log(`[sms] FAILED callSid=${session.callSid} outcome=${outcome} error=${err.message}`);
+  }
+}
+async function finalizeCall(session, outcome) {
+  if (!session || session.ended) return;
+  session.ended = true;
+  if (session.transferTimer) { clearTimeout(session.transferTimer); session.transferTimer = null; }
+  await sendSmsSummary(session, outcome);
+  // Keep the session for 10 minutes so late webhooks can still find it, then drop it.
+  setTimeout(() => sessions.delete(session.callSid), 10 * 60 * 1000);
+}
+
+// ------------------------------------------------------------------- LLM
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'transfer_to_owner',
+      description: 'Transfer the caller to the business owner. ONLY call this when it is within transfer hours (the system message says TRANSFER AVAILABLE) and the caller asks for the owner/a real person, or the request is a refund, credit, or complaint.',
+      parameters: {
+        type: 'object',
+        properties: { reason: { type: 'string', description: 'One sentence: what the caller wants from the owner.' } },
+        required: ['reason'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'take_message',
+      description: 'Take a message for the business owner. Call this after confirming the caller name, callback number, and their question.',
+      parameters: {
+        type: 'object',
+        properties: {
+          caller_name: { type: 'string', description: 'Caller name, or "not given".' },
+          callback_number: { type: 'string', description: 'Best callback number, or "not given".' },
+          message: { type: 'string', description: 'The question/request in one sentence.' },
+        },
+        required: ['caller_name', 'callback_number', 'message'],
+      },
+    },
+  },
+];
+
+/**
+ * Parse a tool call out of plain model text — the Gemini fallback.
+ * Gemini's OpenAI-compatible endpoint has limited/beta tool calling, so
+ * if it answers in words instead of a tool call, it may emit JSON like:
+ *   {"action":"transfer_to_owner","reason":"..."}
+ *   {"action":"take_message","caller_name":"...","callback_number":"...","message":"..."}
+ * Returns { name, args } or null. Never speaks the JSON to the caller.
+ */
+function parseToolCallFromText(text) {
+  if (!text) return null;
+  const m = String(text).match(/\{[\s\S]*?"action"\s*:\s*"(transfer_to_owner|take_message)"[\s\S]*?\}/);
+  if (!m) return null;
+  try {
+    const obj = JSON.parse(m[0]);
+    if (obj.action === 'transfer_to_owner') return { name: 'transfer_to_owner', args: { reason: obj.reason || '' } };
+    if (obj.action === 'take_message') return { name: 'take_message', args: { caller_name: obj.caller_name || 'not given', callback_number: obj.callback_number || 'not given', message: obj.message || '' } };
+  } catch { return null; }
+  return null;
+}
+
+/**
+ * One LLM turn. Non-streaming chat completion (Gemini 3.5 Flash-Lite /
+ * gpt-4o-mini answers a short receptionist question in well under a
+ * second), then the reply text is streamed to Twilio in sentence
+ * chunks. Tool calls are handled by the caller. Returns { text,
+ * toolCall } where toolCall is null or { name, args }.
+ */
+async function askLLM(session) {
+  const inHours = isBusinessHours();
+  const messages = [
+    {
+      role: 'system',
+      content:
+        `${SYSTEM_PROMPT}\n\n---\nKNOWLEDGE BASE (only facts you may quote):\n${KNOWLEDGE_BASE}\n---\n` +
+        `Current time: ${nowETFull()} (${TIMEZONE}). ` +
+        (inHours
+          ? `TRANSFER AVAILABLE: it is within ${BUSINESS_HOURS_START}–${BUSINESS_HOURS_END} ${TIMEZONE}, so transfer_to_owner may be used.`
+          : `TRANSFER NOT AVAILABLE: it is outside ${BUSINESS_HOURS_START}–${BUSINESS_HOURS_END} ${TIMEZONE}. Do NOT call transfer_to_owner. Use take_message instead.`) +
+        (LLM_PROVIDER === 'gemini'
+          ? '\nIf you cannot call a tool, reply with ONLY this JSON on its own line instead of speaking it: {"action":"transfer_to_owner","reason":"..."} or {"action":"take_message","caller_name":"...","callback_number":"...","message":"..."}'
+          : ''),
+    },
+    ...session.history.slice(-20),
+  ];
+  const completion = await openai.chat.completions.create({
+    model: LLM_MODEL, temperature: 0.3, messages, tools: TOOLS, tool_choice: 'auto',
+  });
+  const msg = completion.choices[0]?.message || {};
+  const toolCall = msg.tool_calls?.[0];
+  if (toolCall) {
+    let args = {};
+    try { args = JSON.parse(toolCall.function.arguments || '{}'); } catch { args = {}; }
+    return { text: msg.content || '', toolCall: { name: toolCall.function.name, args } };
+  }
+  // Gemini fallback: model answered in words / JSON instead of a tool call.
+  const fallback = parseToolCallFromText(msg.content || '');
+  if (fallback) {
+    log(`[llm] tool call via JSON fallback provider=${LLM_PROVIDER} name=${fallback.name}`);
+    return { text: '', toolCall: fallback };
+  }
+  return { text: msg.content || '', toolCall: null };
+}
+
+/** Send reply text to ConversationRelay in sentence chunks, last chunk flagged last:true. */
+function sendText(ws, text) {
+  const clean = String(text || '').trim();
+  if (!clean) return;
+  const chunks = clean.split(/(?<=[.!?])\s+/).filter(Boolean);
+  chunks.forEach((chunk, i) => {
+    ws.send(JSON.stringify({ type: 'text', token: chunk + ' ', last: i === chunks.length - 1 }));
+  });
+}
+function endRelay(ws, handoffData) {
+  ws.send(JSON.stringify({ type: 'end', handoffData: JSON.stringify(handoffData) }));
+}
+
+// ------------------------------------------------------------- warm transfer
+function conferenceNameFor(callSid) { return `ai-receptionist-${callSid}`; }
+
+/** Fire-and-forget: call the owner on TRANSFER_NUMBER, play the whisper, join them to the conference on press 1. */
+async function callOwnerForWarmTransfer(session, reason) {
+  if (!twilioClient || !configOk.transferNumber) return;
+  try {
+    const call = await twilioClient.calls.create({
+      to: TRANSFER_NUMBER,
+      from: TWILIO_NUMBER,
+      url: `${PUBLIC_URL}/owner-whisper?origCallSid=${encodeURIComponent(session.callSid)}`,
+      method: 'POST',
+      timeout: TRANSFER_TIMEOUT_SECONDS,
+      statusCallback: `${PUBLIC_URL}/owner-call-status?origCallSid=${encodeURIComponent(session.callSid)}`,
+      statusCallbackEvent: ['completed'],
+    });
+    session.outboundCallSid = call.sid;
+    log(`[transfer] outbound call to the owner sid=${call.sid} origCallSid=${session.callSid}`);
+  } catch (err) {
+    log(`[transfer] FAILED to call the owner origCallSid=${session.callSid} error=${err.message}`);
+  }
+}
+
+/** 25s fallback: if the owner has not joined the conference, move the caller to voicemail-style message taking. */
+async function fallbackIfOwnerNotJoined(session) {
+  session.transferTimer = null;
+  if (session.ownerJoined || session.ended) return;
+  log(`[transfer] no answer in ${TRANSFER_TIMEOUT_SECONDS}s, redirecting caller to /take-message callSid=${session.callSid}`);
+  session.intent = session.intent || 'wanted the owner';
+  if (!twilioClient) { await finalizeCall(session, 'transfer — no answer, message not taken (Twilio not configured)'); return; }
+  try {
+    await twilioClient.calls(session.callSid).update({
+      url: `${PUBLIC_URL}/take-message?callSid=${encodeURIComponent(session.callSid)}&reason=no-answer`,
+      method: 'POST',
+    });
+  } catch (err) {
+    log(`[transfer] redirect FAILED callSid=${session.callSid} error=${err.message}`);
+    await finalizeCall(session, 'transfer — no answer, redirect failed');
+  }
+}
+
+/**
+ * Start the warm transfer. Returns the TwiML that puts the caller in a
+ * conference. The outbound call to the owner and the fallback timer run in the
+ * background — the caller hears hold music, not silence.
+ */
+function startWarmTransfer(session, reason) {
+  session.transferred = true;
+  session.intent = guessIntent(reason) === 'general question' ? truncate(reason, 80) : session.intent || truncate(reason, 80);
+  session.summaryNotes.push(`Transfer requested: ${reason}`);
+  const conf = conferenceNameFor(session.callSid);
+  session.conferenceName = conf;
+  callOwnerForWarmTransfer(session, reason);
+  session.transferTimer = setTimeout(() => { fallbackIfOwnerNotJoined(session); }, TRANSFER_TIMEOUT_SECONDS * 1000);
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say('Please hold while I connect you to the owner.');
+  const dial = twiml.dial({
+    action: `${PUBLIC_URL}/conference-end?callSid=${encodeURIComponent(session.callSid)}`,
+    method: 'POST',
+  });
+  dial.conference(
+    {
+      waitUrl: 'http://twimlets.com/holdmusic?Bucket=com.twilio.music.classical',
+      startConferenceOnEnter: true,
+      endConferenceOnExit: true,
+    },
+    conf,
+  );
+  return twiml.toString();
+}
+
+// ------------------------------------------------------------------ server
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+app.get('/', (_req, res) => res.type('text').send('AI Receptionist — see /health.'));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  service: 'ai-receptionist',
+  timeET: nowETFull(),
+  businessHours: `${BUSINESS_HOURS_START}–${BUSINESS_HOURS_END} ${TIMEZONE}`,
+  transferAvailableNow: isBusinessHours(),
+  configured: configOk,
+  activeSessions: sessions.size,
+}));
+
+/**
+ * POST /voice — Twilio Voice webhook for the Twilio number.
+ * Returns <Connect><ConversationRelay>. The <Connect action> is where
+ * Twilio returns control after the Relay session ends (handoff).
+ */
+app.post('/voice', (req, res) => {
+  const callSid = req.body.CallSid || `unknown-${Date.now()}`;
+  const from = req.body.From || '';
+  getOrCreateSession(callSid, from, req.body.To || TWILIO_NUMBER);
+  log(`[voice] inbound callSid=${callSid} from=${from}`);
+  if (!configOk.publicUrl) {
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say(`Sorry, the ${BUSINESS_NAME} receptionist is not configured yet. Please try again later.`);
+    twiml.hangup();
+    return res.type('text/xml').send(twiml.toString());
+  }
+  const wsUrl = PUBLIC_URL.replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://') + '/relay';
+  const twiml = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect({ action: `${PUBLIC_URL}/connect-action`, method: 'POST' });
+  connect.conversationRelay({
+    url: wsUrl,
+    welcomeGreeting: `Hello, thank you for calling ${BUSINESS_NAME}. I'm an AI assistant. How can I help you today?`,
+    language: 'en-US',
+    ttsProvider: 'Amazon',
+    voice: 'Joanna-Neural',
+    transcriptionProvider: 'Deepgram',
+    interruptible: true,
+  });
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/**
+ * POST /connect-action — Twilio calls this when the Relay session ends.
+ * HandoffData (if any) is a JSON string: { action: 'transfer'|'message', ... }.
+ * SessionStatus 'completed' = caller hung up during the AI conversation.
+ */
+app.post('/connect-action', async (req, res) => {
+  const callSid = req.body.CallSid;
+  const session = getSession(callSid) || getOrCreateSession(callSid, req.body.From, req.body.To);
+  let handoff = {};
+  try { handoff = JSON.parse(req.body.HandoffData || '{}'); } catch { handoff = {}; }
+  log(`[connect-action] callSid=${callSid} status=${req.body.SessionStatus} handoff=${JSON.stringify(handoff)}`);
+
+  if (handoff.action === 'transfer') {
+    if (!isBusinessHours() || !configOk.transferNumber) {
+      // Defence in depth: the LLM should never request this out of hours,
+      // but if it does — or if TRANSFER_NUMBER is unset / would loop back
+      // to Twilio — take a message instead of transferring.
+      log(`[connect-action] transfer refused (out of hours / no valid TRANSFER_NUMBER / loop risk) callSid=${callSid}`);
+      const twiml = new twilio.twiml.VoiceResponse();
+      twiml.say("The owner isn't available right now, but I can take a message for them.");
+      twiml.redirect({ method: 'POST' }, `${PUBLIC_URL}/take-message?callSid=${encodeURIComponent(callSid)}&reason=out-of-hours`);
+      return res.type('text/xml').send(twiml.toString());
+    }
+    return res.type('text/xml').send(startWarmTransfer(session, handoff.reason || 'wants to speak to the owner'));
+  }
+
+  if (handoff.action === 'message') {
+    session.messageTaken = true;
+    session.callerName = handoff.caller_name || session.callerName;
+    session.callbackNumber = handoff.callback_number || session.callbackNumber;
+    session.messageText = handoff.message || '';
+    session.intent = session.intent || guessIntent(session.messageText);
+    await finalizeCall(session, 'message taken by AI');
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say('Thank you. The owner will call you back.');
+    twiml.hangup();
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // No handoff: caller hung up, or the AI ended the call after answering.
+  await finalizeCall(session, session.transferred ? 'transferred' : 'answered by AI, caller hung up');
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/**
+ * POST /owner-whisper — TwiML for the outbound leg to the owner.
+ * Plays the whisper summary, then Gather: 1 = accept and join the
+ * conference, 2 / no input = decline (the caller falls back to a message).
+ */
+app.post('/owner-whisper', (req, res) => {
+  const origCallSid = req.query.origCallSid;
+  const session = getSession(origCallSid);
+  const summary = session
+    ? `Caller ${session.from} asking about ${session.intent || 'a general question'}. ${truncate(session.summaryNotes.join(' '), 160)}`
+    : `A ${BUSINESS_NAME} caller wants to speak to you.`;
+  const twiml = new twilio.twiml.VoiceResponse();
+  const gather = twiml.gather({
+    numDigits: 1, timeout: WHISPER_TIMEOUT_SECONDS,
+    action: `${PUBLIC_URL}/owner-accept?origCallSid=${encodeURIComponent(origCallSid)}`, method: 'POST',
+  });
+  gather.say(`${BUSINESS_NAME} call. ${escapeXml(summary)} Press 1 to accept and join the call, or press 2 to decline.`);
+  twiml.say('No input received. I will let the caller leave a message.');
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/** POST /owner-accept — the owner pressed 1: join the conference. Anything else: decline. */
+app.post('/owner-accept', (req, res) => {
+  const origCallSid = req.query.origCallSid;
+  const session = getSession(origCallSid);
+  const digits = req.body.Digits || '';
+  log(`[owner-accept] origCallSid=${origCallSid} digits=${digits}`);
+  if (digits === '1' && session?.conferenceName) {
+    session.ownerJoined = true;
+    if (session.transferTimer) { clearTimeout(session.transferTimer); session.transferTimer = null; }
+    const twiml = new twilio.twiml.VoiceResponse();
+    const dial = twiml.dial({
+      action: `${PUBLIC_URL}/owner-left?origCallSid=${encodeURIComponent(origCallSid)}`, method: 'POST',
+    });
+    dial.conference(
+      { startConferenceOnEnter: true, endConferenceOnExit: true },
+      session.conferenceName,
+    );
+    return res.type('text/xml').send(twiml.toString());
+  }
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say('Thanks. I will let the caller leave a message.');
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/** POST /owner-call-status — outbound the owner leg finished (no answer / busy / declined). The 25s timer handles the caller fallback; this is just logging. */
+app.post('/owner-call-status', (req, res) => {
+  log(`[owner-call-status] origCallSid=${req.query.origCallSid} status=${req.body.CallStatus} duration=${req.body.CallDuration || 0}s`);
+  return res.sendStatus(200);
+});
+
+/** POST /owner-left — the owner's conference leg ended (he hung up, or the conference ended). Finalise the SMS if it has not been sent. */
+app.post('/owner-left', async (req, res) => {
+  const session = getSession(req.query.origCallSid);
+  if (session) await finalizeCall(session, 'transferred to the owner — call ended');
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/** POST /conference-end — the caller's conference leg ended. Finalise the SMS. */
+app.post('/conference-end', async (req, res) => {
+  const session = getSession(req.query.callSid);
+  if (session) {
+    await finalizeCall(session, session.ownerJoined ? 'transferred to the owner — call ended' : 'transfer ended');
+  }
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/**
+ * POST /take-message — fallback message taking (conference no-answer, or
+ * out-of-hours redirect). Records a voicemail with transcription.
+ */
+app.post('/take-message', (req, res) => {
+  const callSid = req.query.callSid || req.body.CallSid;
+  log(`[take-message] callSid=${callSid} reason=${req.query.reason || ''}`);
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say("The owner isn't available right now. Please leave your name, callback number, and a brief message after the beep, and you will get a call back.");
+  twiml.record({
+    maxLength: 120, timeout: 5, playBeep: true, transcribe: true,
+    transcribeCallback: `${PUBLIC_URL}/record-done?callSid=${encodeURIComponent(callSid || '')}`,
+    action: `${PUBLIC_URL}/record-done?callSid=${encodeURIComponent(callSid || '')}`, method: 'POST',
+  });
+  twiml.say('Thank you. The owner will call you back.');
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+/** POST /record-done — voicemail recorded / transcribed. Send the SMS summary. */
+app.post('/record-done', async (req, res) => {
+  const callSid = req.query.callSid || req.body.CallSid;
+  const session = getSession(callSid);
+  const text = req.body.TranscriptionText || '';
+  log(`[record-done] callSid=${callSid} duration=${req.body.RecordingDuration || 0}s transcription=${truncate(text, 120)}`);
+  if (session) {
+    session.messageTaken = true;
+    session.messageText = text || '(voicemail recorded, no transcription yet)';
+    session.intent = session.intent || guessIntent(text);
+    await finalizeCall(session, 'message taken (voicemail)');
+  } else if (twilioClient && configOk.personalMobile) {
+    // Session expired (server restarted mid-call) — still notify the owner.
+    try {
+      await twilioClient.messages.create({
+        from: TWILIO_NUMBER, to: PERSONAL_MOBILE,
+        body: `${BUSINESS_NAME} voicemail ${nowETFull()} (${TIMEZONE})\nFrom: ${req.body.From || 'unknown'}\nMessage: ${truncate(text, 200)}`,
+      });
+    } catch (err) { log(`[record-done] SMS fallback FAILED error=${err.message}`); }
+  }
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say('Thank you. The owner will call you back.');
+  twiml.hangup();
+  return res.type('text/xml').send(twiml.toString());
+});
+
+// ------------------------------------------------------- ConversationRelay WS
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/relay' });
+
+wss.on('connection', (ws) => {
+  let session = null;
+  let closed = false;
+
+  ws.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === 'setup') {
+      session = getOrCreateSession(msg.callSid, msg.from, msg.to);
+      log(`[relay] setup callSid=${msg.callSid} from=${msg.from} to=${msg.to}`);
+      return;
+    }
+    if (!session) return; // ignore messages before setup
+
+    if (msg.type === 'interrupt') {
+      session.turnId += 1; // invalidate any in-flight LLM turn
+      return;
+    }
+    if (msg.type === 'dtmf') {
+      log(`[relay] dtmf callSid=${session.callSid} digit=${msg.digit}`);
+      if (msg.digit === '0' && isBusinessHours() && configOk.transferNumber) {
+        sendText(ws, 'I will connect you to the owner now, please hold.');
+        endRelay(ws, { action: 'transfer', reason: 'caller pressed 0 for a real person' });
+      }
+      return;
+    }
+    if (msg.type === 'error') {
+      log(`[relay] error callSid=${session.callSid} ${JSON.stringify(msg)}`);
+      return;
+    }
+    if (msg.type !== 'prompt' || !msg.last) return; // only act on finished utterances
+
+    const userText = (msg.voicePrompt || '').trim();
+    if (!userText) return;
+    const turnId = ++session.turnId;
+    log(`[relay] prompt callSid=${session.callSid} text=${truncate(userText, 120)}`);
+    if (!session.intent) session.intent = guessIntent(userText);
+    session.history.push({ role: 'user', content: userText });
+
+    if (!openai) {
+      sendText(ws, "I'm sorry, I'm not able to answer right now. Please leave your name and number after the beep and the owner will call you back.");
+      endRelay(ws, { action: 'message', caller_name: 'not given', callback_number: session.from || 'not given', message: userText });
+      return;
+    }
+
+    let result;
+    try {
+      result = await askLLM(session);
+    } catch (err) {
+      // Log the full SDK error: the bare message ("404 status code (no body)")
+      // hid whether the failure was the model name, the endpoint, or the
+      // key/project. The error body never contains the API key.
+      const detail = { status: err.status, code: err.code, type: err.type, body: err.error || err.body || null };
+      log(`[llm] FAILED callSid=${session.callSid} provider=${LLM_PROVIDER} model=${LLM_MODEL} error=${err.message} detail=${JSON.stringify(detail)}`);
+      sendText(ws, "Sorry, I had trouble with that. Could you say it once more, or I can take a message for the owner.");
+      return;
+    }
+    if (closed || turnId !== session.turnId) return; // caller interrupted / hung up
+
+    if (result.toolCall) {
+      const { name, args } = result.toolCall;
+      if (name === 'transfer_to_owner') {
+        const reason = args.reason || session.intent || 'wants to speak to the owner';
+        session.summaryNotes.push(`Transfer: ${reason}`);
+        sendText(ws, "I'll connect you to the owner now, please hold.");
+        endRelay(ws, { action: 'transfer', reason });
+        return;
+      }
+      if (name === 'take_message') {
+        session.callerName = args.caller_name && args.caller_name !== 'not given' ? args.caller_name : session.callerName;
+        session.callbackNumber = args.callback_number && args.callback_number !== 'not given' ? args.callback_number : session.callbackNumber;
+        session.messageText = args.message || '';
+        session.intent = session.intent || guessIntent(args.message);
+        sendText(ws, "I'll pass your message to the owner and you will get a call back.");
+        endRelay(ws, {
+          action: 'message',
+          caller_name: session.callerName || 'not given',
+          callback_number: session.callbackNumber || session.from || 'not given',
+          message: session.messageText,
+        });
+        return;
+      }
+    }
+
+    if (result.text) {
+      session.history.push({ role: 'assistant', content: result.text });
+      sendText(ws, result.text);
+    }
+  });
+
+  ws.on('close', () => {
+    closed = true;
+    if (!session) return;
+    // Backup finalisation: if the Relay socket closed without a handoff
+    // (e.g. caller hung up), the /connect-action hook normally finalises
+    // the SMS. This covers the case where it never arrives.
+    setTimeout(() => {
+      if (session && !session.smsSent && !session.transferred && session.history.length > 0) {
+        finalizeCall(session, 'answered by AI, call ended').catch(() => {});
+      }
+    }, 5000);
+  });
+  ws.on('error', (err) => log(`[relay] ws error ${err.message}`));
+});
+
+// -------------------------------------------------------------------- start
+server.listen(PORT, () => {
+  log(`AI Receptionist listening on :${PORT} — health at /health`);
+  log(`Business hours ${BUSINESS_HOURS_START}–${BUSINESS_HOURS_END} ${TIMEZONE}; transfer timeout ${TRANSFER_TIMEOUT_SECONDS}s`);
+  log(`Configured: ${JSON.stringify(configOk)}`);
+});
