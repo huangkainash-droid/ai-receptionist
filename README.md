@@ -36,6 +36,10 @@ message — it never invents an address, price, or policy.
   what it was about, outcome, and callback number. Sent once per call.
 - Transfer loop guard: the server refuses to transfer a call to a
   number that forwards back to Twilio (see "The transfer loop warning").
+- SHAKEN/STIR screening: calls whose caller-ID verification explicitly
+  failed are turned away before the AI answers; every other call
+  (verified, unverified, or no attestation from the carrier) is handled
+  normally, and the attestation value is logged on every call.
 - Detailed LLM error logging: every failed model call logs the status,
   error code, and response body, so a provider failure is diagnosable
   from the server logs.

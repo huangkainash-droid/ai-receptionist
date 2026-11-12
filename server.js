@@ -638,6 +638,19 @@ app.get('/health', (_req, res) => res.json({
   activeSessions: sessions.size,
 }));
 
+// SHAKEN/STIR screening (2026-11-12): Twilio verifies inbound calls and
+// passes the result as the StirVerstat webhook parameter — but ONLY when
+// the originating carrier supplies SHAKEN PASSporT headers, so the
+// parameter is often absent on legitimate calls. Policy: block ONLY an
+// explicit verification failure (TN-Validation-Failed-*), which means a
+// PASSporT was present but its signature did not verify — a strong
+// spoofing signal. Every other value (Passed-A/B/C, No-TN-Validation,
+// absent) is handled normally. The value is logged on every call so the
+// distribution is visible in production logs before any stricter policy.
+function stirVerstatBlocked(value) {
+  return typeof value === 'string' && value.startsWith('TN-Validation-Failed');
+}
+
 /**
  * POST /voice — Twilio Voice webhook for the Twilio number.
  * Returns <Connect><ConversationRelay>. The <Connect action> is where
@@ -646,8 +659,16 @@ app.get('/health', (_req, res) => res.json({
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid || `unknown-${Date.now()}`;
   const from = req.body.From || '';
+  const stirVerstat = req.body.StirVerstat || '';
+  if (stirVerstatBlocked(stirVerstat)) {
+    log(`[voice] BLOCKED failed SHAKEN/STIR validation stirVerstat=${stirVerstat} callSid=${callSid} from=${from}`);
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say("We're sorry, we couldn't verify this call, so we can't connect you. Please reach us through our website.");
+    twiml.hangup();
+    return res.type('text/xml').send(twiml.toString());
+  }
   getOrCreateSession(callSid, from, req.body.To || TWILIO_NUMBER);
-  log(`[voice] inbound callSid=${callSid} from=${from}`);
+  log(`[voice] inbound callSid=${callSid} from=${from} stirVerstat=${stirVerstat || '(absent)'}`);
   if (!configOk.publicUrl) {
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.say(`Sorry, the ${BUSINESS_NAME} receptionist is not configured yet. Please try again later.`);
