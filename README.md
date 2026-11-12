@@ -50,6 +50,8 @@ message — it never invents an address, price, or policy.
   Gemini by default, OpenAI as fallback)
 - `package.json`, `Dockerfile`, `railway.json` — run / deploy
 - `prompts/system-prompt.md` — the receptionist's instructions (template)
+- `prompts/chat-system-prompt.md` — the website chat assistant's instructions (template: links allowed, no phone transfer)
+- `public/chat-widget.js` — the embeddable website chat widget (served at `GET /widget.js`; fill in the CONFIG block first)
 - `knowledge-base.md` — the only facts the AI may quote (template — edit
   this, not code)
 - `.env.example` — every setting, with placeholders only (never real
@@ -447,6 +449,62 @@ Edit `knowledge-base.md` for prices, dates, locations, and policies,
 and `prompts/system-prompt.md` for behaviour. Restart the server
 after editing — both files are loaded at startup. Do not edit facts
 in `server.js`; the code only reads the two files.
+
+## Website chat widget
+
+The same LLM, knowledge base, and take_message SMS flow also answer
+a chat widget on your website. The website chat uses its own system
+prompt (`prompts/chat-system-prompt.md`): web chat may quote links
+(booking, locations, prices, FAQs) and has no phone transfer —
+visitors who want a person get the phone number and an offer to
+take a message.
+
+**Endpoints** (same server, no extra deploy):
+
+- `GET /widget.js` — the widget script (cached 5 minutes).
+- `POST /chat` — `{ sessionId, message }` → `{ sessionId, reply }`.
+  CORS allowlist, per-IP rate limit (30/min), 1,000-char messages,
+  in-memory sessions with a 30-minute idle TTL.
+
+**Setup** (3 steps):
+
+1. Fill in the CONFIG block at the top of `public/chat-widget.js`
+   (business name, phone, email, greeting, quick replies, allowed
+   link hosts, colors).
+2. Fill in `prompts/chat-system-prompt.md` — the same placeholders
+   as the phone prompt, plus the exact links under "Links you may
+   use". Only those links are ever quoted.
+3. Set `CHAT_ALLOWED_ORIGINS` to the origin the widget is embedded
+   on (e.g. `https://www.example.com`), comma-separated for several
+   sites. Empty means no browser origin is allowed.
+
+**Embed** — one script tag, anywhere before `</body>`. The widget
+derives the API base URL from the script's own `src`, so no other
+configuration is needed:
+
+```html
+<script src="https://<your-domain>/widget.js" async></script>
+```
+
+**Editing:** `prompts/chat-system-prompt.md` for chat behaviour,
+`public/chat-widget.js` for the widget UI, `knowledge-base.md` for
+facts. All three are loaded at startup — restart / redeploy after
+editing.
+
+**Test before embedding** (run against the deployed `/chat`):
+
+1. A question with a known answer in your knowledge base → correct
+   fact, nothing invented.
+2. A question about something NOT in the knowledge base → says it
+   does not have that information, offers a message.
+3. A refund / complaint request → offers the phone number / takes a
+   message, never promises anything.
+4. "How do I book?" → links your booking page, and only that page.
+5. Message flow: ask for a callback, give a name + number → SMS
+   summary to `PERSONAL_MOBILE`, one per session.
+
+**Cost:** one chat reply costs about the same as one phone turn
+(Gemini 3.5 Flash-Lite, a fraction of a cent). No new subscription.
 
 ## Limitations
 

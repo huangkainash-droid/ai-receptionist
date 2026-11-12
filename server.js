@@ -7,6 +7,12 @@
  * hours, takes messages outside them, and sends an SMS summary after
  * every call.
  *
+ * Website chat: POST /chat + GET /widget.js reuse the same LLM,
+ * knowledge base, and take_message flow for a chat widget embedded on
+ * the business website. Chat uses its own system prompt
+ * (prompts/chat-system-prompt.md) because web chat may quote links and
+ * has no phone transfer. See the "Website chat" section below.
+ *
  * Stack: Twilio ConversationRelay (Twilio does STT + TTS, $0.07/min)
  *        + Gemini gemini-3.5-flash-lite (text LLM, via Google's
  *          OpenAI-compatible endpoint; $0.30 / 1M input tokens,
@@ -164,6 +170,14 @@ const BUSINESS_HOURS_START = process.env.BUSINESS_HOURS_START || '08:00';
 const BUSINESS_HOURS_END = process.env.BUSINESS_HOURS_END || '17:00';
 const TRANSFER_TIMEOUT_SECONDS = Number(process.env.TRANSFER_TIMEOUT_SECONDS || 25);
 const WHISPER_TIMEOUT_SECONDS = Number(process.env.WHISPER_TIMEOUT_SECONDS || 10);
+// --- Website chat: CORS allowlist for POST /chat. Set this to the origin
+// the chat widget is embedded on (comma-separated for several sites).
+// Empty means no browser origin is allowed — set it before embedding.
+const CHAT_ALLOWED_ORIGINS = (process.env.CHAT_ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const CHAT_MAX_MESSAGE_CHARS = Number(process.env.CHAT_MAX_MESSAGE_CHARS || 1000);
+const CHAT_RATE_LIMIT_PER_MINUTE = Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE || 30);
+const CHAT_SESSION_TTL_MS = 30 * 60 * 1000;
+const CHAT_MAX_HISTORY_MESSAGES = 24; // 12 turns, same as the voice path
 
 const E164 = /^\+1\d{10}$/;
 const configOk = {
@@ -206,6 +220,8 @@ function readText(relPath, fallback) {
 }
 const SYSTEM_PROMPT = readText('prompts/system-prompt.md', 'You are the AI receptionist for a small business. Answer briefly, in English. Only quote facts you are given. Never promise refunds. Offer to take a message when unsure.');
 const KNOWLEDGE_BASE = readText('knowledge-base.md', '');
+const CHAT_SYSTEM_PROMPT = readText('prompts/chat-system-prompt.md', 'You are the AI assistant on a small business website. Answer briefly, in English. Only quote facts you are given. Never promise refunds. Offer to take a message when unsure.');
+const CHAT_WIDGET_JS = readText('public/chat-widget.js', ''); // served at GET /widget.js; restart after editing, like the prompts
 
 // ---------------------------------------------------------------- helpers
 function log(...args) {
@@ -622,6 +638,176 @@ function startWarmTransfer(session, reason) {
   return twiml.toString();
 }
 
+// ------------------------------------------------------------ Website chat
+// POST /chat + GET /widget.js. The website chat widget reuses the voice
+// path's LLM client, knowledge base, and take_message SMS flow, with its
+// own system prompt (chat may quote links; no phone transfer). Sessions
+// are in-memory with a 30-minute idle TTL, like call sessions.
+// Deliberately separate from askLLM(): the voice path streams tokens to
+// Twilio and must not change; chat streams too, but buffers the tokens
+// server-side and answers the widget with one JSON round-trip.
+
+const CHAT_TOOLS = [TOOLS[1]]; // take_message only — no transfer from web chat
+
+/** sessionId -> chat session. In-memory only; a restart loses open chats. */
+const chatSessions = new Map();
+
+function getOrCreateChatSession(id) {
+  const now = Date.now();
+  for (const [key, s] of chatSessions) {
+    if (now - s.lastSeen > CHAT_SESSION_TTL_MS) chatSessions.delete(key);
+  }
+  if (chatSessions.size > 500) {
+    const oldest = [...chatSessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen)[0];
+    if (oldest) chatSessions.delete(oldest[0]);
+  }
+  if (!chatSessions.has(id)) {
+    chatSessions.set(id, {
+      id, createdAt: new Date().toISOString(), lastSeen: now,
+      history: [], smsSent: false, messageTaken: false,
+    });
+  }
+  const s = chatSessions.get(id);
+  s.lastSeen = now;
+  return s;
+}
+
+/** Tiny per-IP rate limiter for /chat (no new dependency). */
+const chatRate = new Map(); // ip -> { windowStart, count }
+function chatRateLimited(ip) {
+  const now = Date.now();
+  const entry = chatRate.get(ip);
+  if (!entry || now - entry.windowStart >= 60000) {
+    chatRate.set(ip, { windowStart: now, count: 1 });
+    return false;
+  }
+  entry.count += 1;
+  if (chatRate.size > 1000) {
+    for (const [key, e] of chatRate) if (now - e.windowStart >= 60000) chatRate.delete(key);
+  }
+  return entry.count > CHAT_RATE_LIMIT_PER_MINUTE;
+}
+
+function chatCors(req, res) {
+  const origin = req.headers.origin || '';
+  if (origin && CHAT_ALLOWED_ORIGINS.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Vary', 'Origin');
+  }
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+/** One chat turn: STREAMED completion, buffered server-side, with a hard
+ * timeout. The voice path proved streaming is the reliable shape on
+ * Gemini's OpenAI-compatible endpoint; a non-streaming completion
+ * intermittently hung for ~300s per turn in live tests. Buffering keeps
+ * the widget on a single JSON round-trip while the stream keeps the
+ * request alive. A 60s abort bounds the worst case to a friendly 502
+ * instead of a multi-minute hang. Tool calls arrive as deltas (same as
+ * the voice path) or as the Gemini JSON fallback in the text.
+ */
+async function askChatLLM(chatSession) {
+  const startedAt = Date.now();
+  const messages = [
+    {
+      role: 'system',
+      content:
+        `${CHAT_SYSTEM_PROMPT}\n\n---\nKNOWLEDGE BASE (only facts you may quote):\n${KNOWLEDGE_BASE}\n---\n` +
+        `Current time: ${nowETFull()} (${TIMEZONE}).` +
+        (LLM_PROVIDER === 'gemini'
+          ? '\nIf you cannot call a tool, reply with ONLY this JSON on its own line instead of speaking it: {"action":"take_message","caller_name":"...","callback_number":"...","message":"..."}'
+          : ''),
+    },
+    ...chatSession.history.slice(-CHAT_MAX_HISTORY_MESSAGES),
+  ];
+  // NOTE: `signal` MUST be the second (options) argument, never part of
+  // the request body — the OpenAI SDK serializes unknown body keys into
+  // the JSON payload, and Gemini's endpoint rejects the request with a
+  // bare HTTP 400. maxRetries: 1 bounds retry storms on the same endpoint.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  let stream;
+  try {
+    stream = await openai.chat.completions.create({
+      model: LLM_MODEL, temperature: 0.3, max_tokens: 400,
+      messages, tools: CHAT_TOOLS, tool_choice: 'auto', stream: true,
+    }, { signal: controller.signal, maxRetries: 1 });
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+  let fullText = '';
+  let toolName = null;
+  let toolArgsText = '';
+  let sawToolCall = false;
+  let firstTokenAt = 0;
+  try {
+    for await (const chunk of stream) {
+      if (!firstTokenAt) firstTokenAt = Date.now();
+      const delta = chunk.choices?.[0]?.delta || {};
+      if (delta.tool_calls?.length) {
+        sawToolCall = true;
+        for (const tc of delta.tool_calls) {
+          if (tc.function?.name) toolName = tc.function.name;
+          toolArgsText += tc.function?.arguments || '';
+        }
+      }
+      if (delta.content) fullText += delta.content;
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+  const elapsedMs = Date.now() - startedAt;
+  const ttfbMs = firstTokenAt ? firstTokenAt - startedAt : -1;
+  if (sawToolCall && toolName === 'take_message') {
+    let args = {};
+    try { args = JSON.parse(toolArgsText || '{}'); } catch { args = {}; }
+    log(`[chat-llm] tool=take_message ms=${elapsedMs} ttfbMs=${ttfbMs}`);
+    return { text: '', toolCall: { name: 'take_message', args } };
+  }
+  const fallback = parseToolCallFromText(fullText);
+  if (fallback) {
+    if (fallback.name === 'take_message') {
+      log(`[chat-llm] tool call via JSON fallback ms=${elapsedMs} ttfbMs=${ttfbMs}`);
+      return { text: '', toolCall: fallback };
+    }
+    // JSON-shaped but not a chat tool (e.g. a transfer request): never
+    // show raw JSON in the widget.
+    log(`[chat-llm] unexpected JSON-shaped reply, using fallback ms=${elapsedMs} ttfbMs=${ttfbMs}`);
+    return { text: 'Sorry, I had trouble with that. Could you try asking it a different way?', toolCall: null };
+  }
+  const text = fullText.trim();
+  if (!text || text.startsWith('{')) {
+    log(`[chat-llm] empty/unusable reply, using fallback ms=${elapsedMs} ttfbMs=${ttfbMs}`);
+    return { text: 'Sorry, I had trouble with that. Could you try asking it a different way?', toolCall: null };
+  }
+  log(`[chat-llm] done ms=${elapsedMs} ttfbMs=${ttfbMs} chars=${text.length}`);
+  return { text, toolCall: null };
+}
+
+/** SMS summary to the owner for a message taken in web chat — same path as call summaries. */
+async function sendChatMessageSms(chatSession, args) {
+  if (chatSession.smsSent) return;
+  chatSession.smsSent = true; // set before the await: prevents double-send
+  const body =
+    `${BUSINESS_NAME} website chat ${nowETFull()} (${TIMEZONE})\n` +
+    `Name: ${args.caller_name || 'not given'}\n` +
+    `Contact: ${args.callback_number || 'not given'}\n` +
+    `About: ${guessIntent(args.message)}\n` +
+    `Message: ${truncate(args.message, 200)}`;
+  if (!twilioClient || !configOk.personalMobile) {
+    log(`[chat-sms] NOT SENT (Twilio/personal mobile not configured) session=${chatSession.id}\n${body}`);
+    return;
+  }
+  try {
+    const msg = await twilioClient.messages.create({ from: TWILIO_NUMBER, to: PERSONAL_MOBILE, body });
+    log(`[chat-sms] sent sid=${msg.sid} session=${chatSession.id}`);
+  } catch (err) {
+    log(`[chat-sms] FAILED session=${chatSession.id} error=${err.message}`);
+  }
+}
+
 // ------------------------------------------------------------------ server
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -636,7 +822,71 @@ app.get('/health', (_req, res) => res.json({
   transferAvailableNow: isBusinessHours(),
   configured: configOk,
   activeSessions: sessions.size,
+  chat: { enabled: true, activeChatSessions: chatSessions.size, allowedOrigins: CHAT_ALLOWED_ORIGINS },
 }));
+
+// Website chat widget file + API (see the "Website chat" section above).
+app.get('/widget.js', (req, res) => {
+  if (!CHAT_WIDGET_JS) return res.sendStatus(404);
+  res.type('application/javascript');
+  res.set('Cache-Control', 'public, max-age=300'); // short: widget updates propagate within minutes
+  res.send(CHAT_WIDGET_JS);
+});
+app.options('/chat', (req, res) => { chatCors(req, res); res.sendStatus(204); });
+app.post('/chat', async (req, res) => {
+  chatCors(req, res);
+  const ip = (String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.ip || 'unknown';
+  if (chatRateLimited(ip)) {
+    log(`[chat] rate limited ip=${ip}`);
+    return res.status(429).json({ error: 'Too many messages. Please wait a minute and try again.' });
+  }
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message) return res.status(400).json({ error: 'A message is required.' });
+  if (message.length > CHAT_MAX_MESSAGE_CHARS) return res.status(400).json({ error: 'Message is too long.' });
+  let sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) {
+    sessionId = `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+  const chatSession = getOrCreateChatSession(sessionId);
+  log(`[chat] session=${sessionId} text=${truncate(message, 120)}`);
+  if (!openai) {
+    log(`[chat] LLM not configured, returning fallback session=${sessionId}`);
+    return res.status(503).json({ error: 'The assistant is not available right now. Please contact the business directly.' });
+  }
+  chatSession.history.push({ role: 'user', content: message });
+  if (chatSession.history.length > CHAT_MAX_HISTORY_MESSAGES * 2) {
+    chatSession.history = chatSession.history.slice(-CHAT_MAX_HISTORY_MESSAGES);
+  }
+  let result;
+  try {
+    result = await askChatLLM(chatSession);
+  } catch (err) {
+    // Log the full SDK error (the bare message hid whether the failure
+    // was the model name, the endpoint, or the key — see the voice path).
+    const detail = { status: err.status, code: err.code, type: err.type, body: err.error || err.body || null };
+    log(`[chat] LLM FAILED session=${sessionId} provider=${LLM_PROVIDER} model=${LLM_MODEL} error=${err.message} detail=${JSON.stringify(detail)}`);
+    return res.status(502).json({ error: 'Sorry, I had trouble with that. Please try again, or contact the business directly.' });
+  }
+  if (result.toolCall?.name === 'take_message') {
+    const args = result.toolCall.args || {};
+    const name = String(args.caller_name || '').trim();
+    const contact = String(args.callback_number || '').trim();
+    const msgText = String(args.message || '').trim();
+    chatSession.messageTaken = true;
+    await sendChatMessageSms(chatSession, {
+      caller_name: name || 'not given',
+      callback_number: contact || 'not given',
+      message: msgText || message,
+    });
+    const reply = (name && name !== 'not given' && contact && contact !== 'not given')
+      ? `Thanks, ${name}. I've passed your message to the owner, and you'll get a call back at ${contact}. Is there anything else I can help with?`
+      : "Thanks — I've passed your message to the owner, and you'll get a call back. Is there anything else I can help with?";
+    chatSession.history.push({ role: 'assistant', content: reply });
+    return res.json({ sessionId, reply, messageTaken: true });
+  }
+  chatSession.history.push({ role: 'assistant', content: result.text });
+  return res.json({ sessionId, reply: result.text });
+});
 
 // SHAKEN/STIR screening (2026-11-12): Twilio verifies inbound calls and
 // passes the result as the StirVerstat webhook parameter — but ONLY when
