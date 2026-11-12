@@ -479,6 +479,14 @@ in `server.js`; the code only reads the two files.
   The detailed `[llm] FAILED` log line records the provider, model,
   status, and any error body, which is what distinguishes this
   failure from a bad key (which returns an error body).
+- **Every LLM call fails with `[llm] FAILED … error=400 status code
+  (no body)`:** check that `signal` is passed as the second
+  (options) argument to `chat.completions.create`, never inside the
+  request body. The OpenAI SDK serializes unknown body keys into
+  the JSON payload (`"signal": {}`), and Gemini's OpenAI-compatible
+  endpoint rejects the request with a bare HTTP 400. This broke
+  every turn of a real call until the fix; billing and the key were
+  not the cause.
 - **AI answers, but slowly (multi-second pause before each reply):**
   check the `[llm] done … ttfbMs=…` lines in the server logs. If
   TTFB is in the seconds on Gemini, the project's billing tier is

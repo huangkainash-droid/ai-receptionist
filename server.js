@@ -266,6 +266,9 @@ function isTransferRequest(text, session) {
   const names = ['manager', 'owner', 'person', 'someone', 'human', 'agent', 'representative'];
   if (OWNER_FIRST_NAME) names.push(OWNER_FIRST_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   if (new RegExp(`\\b(speak|talk)\\b.{0,20}\\b(to|with)\\b.{0,20}\\b(${names.join('|')})\\b`).test(t)) return true;
+  // "Call the manager" must transfer ("call me back" must not: no person
+  // word follows the verb, so callback requests still reach the LLM).
+  if (new RegExp(`\\b(call|ring|reach|get|put me through to)\\b.{0,20}\\b(${names.join('|')})\\b`).test(t)) return true;
   if (/\b(transfer|connect)\b.{0,10}\b(me|us)\b/.test(t)) return true;
   if (/\b(real person|live person|human being|actual person)\b/.test(t)) return true;
   // Information questions are NOT transfer requests, even when they
@@ -438,11 +441,16 @@ async function askLLM(session, sendToken, signal) {
   };
   let stream;
   try {
-    stream = await openai.chat.completions.create({ ...request, stream: true, signal });
+    // NOTE: `signal` MUST be the second (options) argument, never part of
+    // the request body. The OpenAI SDK serializes unknown body keys into
+    // the JSON payload ("signal": {}), and Gemini's OpenAI-compatible
+    // endpoint rejects the request with a bare HTTP 400. Passing it in
+    // the body broke every LLM call until this fix.
+    stream = await openai.chat.completions.create({ ...request, stream: true }, { signal });
   } catch (streamErr) {
     if (signal?.aborted) throw streamErr; // superseded turn: do not fall back, just stop
     log(`[llm] streaming unavailable, falling back to non-streaming error=${streamErr.message}`);
-    const completion = await openai.chat.completions.create({ ...request, signal });
+    const completion = await openai.chat.completions.create({ ...request }, { signal });
     const msg = completion.choices[0]?.message || {};
     const toolCall = msg.tool_calls?.[0];
     if (toolCall) {
