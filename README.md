@@ -506,8 +506,8 @@ editing.
 3. A refund / complaint request → offers the phone number / takes a
    message, never promises anything.
 4. "How do I book?" → links your booking page, and only that page.
-5. Message flow: ask for a callback, give a name + number → SMS
-   summary to `PERSONAL_MOBILE`, one per session.
+5. Message flow: ask for a callback, give a name + number → email
+   to `EMAIL_TO` via Resend, one per session.
 
 **Cost:** one chat reply costs about the same as one phone turn
 (Gemini 3.5 Flash-Lite, a fraction of a cent). No new subscription.

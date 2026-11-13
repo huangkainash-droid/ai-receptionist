@@ -654,7 +654,7 @@ function startWarmTransfer(session, reason) {
 
 // ------------------------------------------------------------ Website chat
 // POST /chat + GET /widget.js. The website chat widget reuses the voice
-// path's LLM client, knowledge base, and take_message SMS flow, with its
+// path's LLM client, knowledge base, and take_message flow, with its
 // own system prompt (chat may quote links; no phone transfer). Sessions
 // are in-memory with a 30-minute idle TTL, like call sessions.
 // Deliberately separate from askLLM(): the voice path streams tokens to
