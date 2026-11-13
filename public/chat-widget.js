@@ -3,7 +3,9 @@
  * Embed with one script tag (served by the same server that answers
  * /chat, so the widget always matches the deployed backend):
  *   <script src="https://<your-domain>/widget.js" async></script>
- * The API base URL is derived from this script's own src; override
+ * The API base URL is derived from this script's own src, with
+ * fallbacks (see API_BASE below — document.currentScript alone is not
+ * reliable under async loading and script optimizers); override
  * with window.AI_RECEPTIONIST_CHAT_API = 'https://<your-domain>'
  * before the script tag if needed. No dependencies, no tracking,
  * no cookies. Conversations are not stored in the browser beyond
@@ -40,13 +42,39 @@
     colorAccent: '#ff6600' // send button + focus ring
   };
 
+  // API base: the server that served this widget file is the server
+  // that answers /chat. document.currentScript alone is NOT reliable:
+  // the embed tag is async, and script optimizers (Cloudflare Rocket
+  // Loader, defer/combine plugins) can rewrite the tag or execute the
+  // file so that currentScript is null or points at a combined file on
+  // the website domain. Either failure sends /chat to the wrong origin
+  // and every question fails. So: prefer the explicit override, then
+  // currentScript, then a scan of every script element for the widget
+  // file itself (including Rocket Loader's data-rocketsrc). If none
+  // matches, API_BASE is '' and requests go to the page origin — set
+  // window.AI_RECEPTIONIST_CHAT_API explicitly in that case.
   var API_BASE = (function () {
     if (window.AI_RECEPTIONIST_CHAT_API) return String(window.AI_RECEPTIONIST_CHAT_API).replace(/\/$/, '');
+    var srcs = [];
     try {
-      var src = (document.currentScript && document.currentScript.src) || '';
-      var m = src.match(/^(https?:\/\/[^/]+)/);
+      if (document.currentScript && document.currentScript.src) srcs.push(document.currentScript.src);
+    } catch (e) { /* ignore */ }
+    try {
+      var scripts = document.getElementsByTagName('script');
+      for (var i = 0; i < scripts.length; i++) {
+        if (scripts[i].src) srcs.push(scripts[i].src);
+        var d = scripts[i].getAttribute && (scripts[i].getAttribute('data-rocketsrc') || scripts[i].getAttribute('data-src'));
+        if (d) srcs.push(d);
+      }
+    } catch (e) { /* ignore */ }
+    // The widget file is served at the domain root as /widget.js; only a
+    // root-level match counts, so another plugin's widget.js nested
+    // under a subpath can never hijack the API base. Scan from the end:
+    // the embed tag sits in the footer, after most other scripts.
+    for (var j = srcs.length - 1; j >= 0; j--) {
+      var m = String(srcs[j]).match(/^(https?:\/\/[^/]+)\/widget\.js(\?.*)?$/);
       if (m) return m[1];
-    } catch (e) { /* fall through */ }
+    }
     return '';
   })();
 
