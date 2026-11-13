@@ -452,8 +452,10 @@ in `server.js`; the code only reads the two files.
 
 ## Website chat widget
 
-The same LLM, knowledge base, and take_message SMS flow also answer
-a chat widget on your website. The website chat uses its own system
+The same LLM, knowledge base, and take_message flow also answer
+a chat widget on your website. Messages visitors leave in chat are
+emailed to the owner via the Resend HTTP API (SMTP does not work
+from hosts like Railway, which block outbound SMTP ports). The website chat uses its own system
 prompt (`prompts/chat-system-prompt.md`): web chat may quote links
 (booking, locations, prices, FAQs) and has no phone transfer —
 visitors who want a person get the phone number and an offer to
@@ -477,6 +479,10 @@ take a message.
 3. Set `CHAT_ALLOWED_ORIGINS` to the origin the widget is embedded
    on (e.g. `https://www.example.com`), comma-separated for several
    sites. Empty means no browser origin is allowed.
+4. Set `RESEND_API_KEY` and `EMAIL_TO` so messages visitors leave
+   in chat reach you by email (free tier, 3,000/mo — sign the
+   Resend account up with the `EMAIL_TO` address). Without them,
+   messages are logged only, never emailed.
 
 **Embed** — one script tag, anywhere before `</body>`. The widget
 derives the API base URL from the script's own `src`, so no other

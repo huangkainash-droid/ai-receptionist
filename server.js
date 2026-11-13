@@ -176,6 +176,18 @@ const WHISPER_TIMEOUT_SECONDS = Number(process.env.WHISPER_TIMEOUT_SECONDS || 10
 const CHAT_ALLOWED_ORIGINS = (process.env.CHAT_ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const CHAT_MAX_MESSAGE_CHARS = Number(process.env.CHAT_MAX_MESSAGE_CHARS || 1000);
 const CHAT_RATE_LIMIT_PER_MINUTE = Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE || 30);
+// Website chat message delivery: messages visitors leave in the chat
+// widget are emailed to the owner via the Resend HTTP API. SMTP was
+// dropped: hosts like Railway block outbound SMTP ports, so SMTP can
+// never work from such a host — Resend sends over HTTPS instead.
+// Only RESEND_API_KEY + EMAIL_TO are required (free tier, 3,000/mo).
+// IMPORTANT: sign the Resend account up with the EMAIL_TO address, or
+// the free tier cannot deliver to it. EMAIL_FROM defaults to Resend's
+// shared onboarding sender; set it to a verified-domain sender if one
+// is added.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const EMAIL_TO = process.env.EMAIL_TO || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || `${BUSINESS_NAME} Chat <onboarding@resend.dev>`;
 const CHAT_SESSION_TTL_MS = 30 * 60 * 1000;
 const CHAT_MAX_HISTORY_MESSAGES = 24; // 12 turns, same as the voice path
 
@@ -189,12 +201,14 @@ const configOk = {
   openai: Boolean(OPENAI_API_KEY),
   gemini: Boolean(GEMINI_API_KEY),
   personalMobile: E164.test(PERSONAL_MOBILE),
+  chatEmail: Boolean(RESEND_API_KEY && EMAIL_TO),
   transferNumber: E164.test(TRANSFER_NUMBER) && !isLoopNumber(TRANSFER_NUMBER),
   publicUrl: Boolean(PUBLIC_URL && /^https:\/\//.test(PUBLIC_URL)),
 };
 if (!configOk.twilio) console.warn('[config] Twilio is not fully configured (need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER in E.164). Voice/SMS will be disabled until set.');
 if (!configOk.llm) console.warn(`[config] No LLM key — set GEMINI_API_KEY (default provider, free at aistudio.google.com/apikey) or OPENAI_API_KEY with LLM_PROVIDER=openai. The AI will use the fallback message only.`);
 if (!configOk.personalMobile) console.warn('[config] PERSONAL_MOBILE is missing or not E.164 (+1 + 10 digits) — SMS summaries are disabled until set.');
+if (!configOk.chatEmail) console.warn('[config] RESEND_API_KEY/EMAIL_TO not set — website chat messages will be logged only, not emailed.');
 if (!process.env.TRANSFER_NUMBER && configOk.personalMobile) console.warn('[config] TRANSFER_NUMBER not set — warm transfer defaults to PERSONAL_MOBILE. That is correct if the personal line does not forward to Twilio.');
 if (!configOk.transferNumber) console.warn('[config] TRANSFER_NUMBER is missing, not E.164, or it would LOOP (it is BUSINESS_NUMBER or the Twilio number itself) — warm transfer is disabled and the AI will take a message instead. Set TRANSFER_NUMBER to a direct number that does not forward to Twilio.');
 if (!configOk.publicUrl) console.warn('[config] PUBLIC_URL is missing or not https:// — Twilio cannot reach this server. Set it to your deployed URL (Railway/Render/Fly) or an ngrok https URL for local testing.');
@@ -664,7 +678,7 @@ function getOrCreateChatSession(id) {
   if (!chatSessions.has(id)) {
     chatSessions.set(id, {
       id, createdAt: new Date().toISOString(), lastSeen: now,
-      history: [], smsSent: false, messageTaken: false,
+      history: [], emailSent: false, messageTaken: false,
     });
   }
   const s = chatSessions.get(id);
@@ -786,25 +800,37 @@ async function askChatLLM(chatSession) {
   return { text, toolCall: null };
 }
 
-/** SMS summary to the owner for a message taken in web chat — same path as call summaries. */
-async function sendChatMessageSms(chatSession, args) {
-  if (chatSession.smsSent) return;
-  chatSession.smsSent = true; // set before the await: prevents double-send
-  const body =
-    `${BUSINESS_NAME} website chat ${nowETFull()} (${TIMEZONE})\n` +
+/** Email to the owner for a message taken in web chat, via the Resend HTTP API (SMTP does not work from hosts like Railway, which block outbound SMTP ports. Voice-call summaries still go by SMS). Never throws: failures are logged, never surfaced to the visitor. */
+async function sendChatMessageEmail(chatSession, args) {
+  if (chatSession.emailSent) return;
+  chatSession.emailSent = true; // set before the await: prevents double-send
+  const subject = `Website chat message from ${args.caller_name || 'a visitor'} — ${BUSINESS_NAME}`;
+  const text =
+    `A visitor left a message in the website chat.\n\n` +
+    `Time: ${nowETFull()} (${TIMEZONE})\n` +
     `Name: ${args.caller_name || 'not given'}\n` +
     `Contact: ${args.callback_number || 'not given'}\n` +
-    `About: ${guessIntent(args.message)}\n` +
-    `Message: ${truncate(args.message, 200)}`;
-  if (!twilioClient || !configOk.personalMobile) {
-    log(`[chat-sms] NOT SENT (Twilio/personal mobile not configured) session=${chatSession.id}\n${body}`);
+    `About: ${guessIntent(args.message)}\n\n` +
+    `${args.message || ''}\n`;
+  if (!RESEND_API_KEY || !EMAIL_TO) {
+    log(`[chat-email] NOT SENT (RESEND_API_KEY/EMAIL_TO not configured) session=${chatSession.id}\n${subject}\n${text}`);
     return;
   }
   try {
-    const msg = await twilioClient.messages.create({ from: TWILIO_NUMBER, to: PERSONAL_MOBILE, body });
-    log(`[chat-sms] sent sid=${msg.sid} session=${chatSession.id}`);
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: EMAIL_FROM, to: [EMAIL_TO], subject, text }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      log(`[chat-email] FAILED session=${chatSession.id} status=${res.status} error=${data.message || 'unknown'}`);
+      return;
+    }
+    log(`[chat-email] sent id=${data.id || 'unknown'} session=${chatSession.id}`);
   } catch (err) {
-    log(`[chat-sms] FAILED session=${chatSession.id} error=${err.message}`);
+    log(`[chat-email] FAILED session=${chatSession.id} error=${err.message}`);
   }
 }
 
@@ -822,7 +848,7 @@ app.get('/health', (_req, res) => res.json({
   transferAvailableNow: isBusinessHours(),
   configured: configOk,
   activeSessions: sessions.size,
-  chat: { enabled: true, activeChatSessions: chatSessions.size, allowedOrigins: CHAT_ALLOWED_ORIGINS },
+  chat: { enabled: true, activeChatSessions: chatSessions.size, allowedOrigins: CHAT_ALLOWED_ORIGINS, emailConfigured: configOk.chatEmail },
 }));
 
 // Website chat widget file + API (see the "Website chat" section above).
@@ -873,7 +899,8 @@ app.post('/chat', async (req, res) => {
     const contact = String(args.callback_number || '').trim();
     const msgText = String(args.message || '').trim();
     chatSession.messageTaken = true;
-    await sendChatMessageSms(chatSession, {
+    // Fire-and-forget: a slow or failing email provider must never hang the visitor's reply. sendChatMessageEmail logs its own failures.
+    sendChatMessageEmail(chatSession, {
       caller_name: name || 'not given',
       callback_number: contact || 'not given',
       message: msgText || message,
